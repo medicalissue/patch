@@ -1,82 +1,87 @@
 import torch
 
 class PatchDetector:
-    """완전히 GPU tensor만 사용하는 Patch Detector"""
-    def __init__(self, attractor_learner, device='cuda', chunk_size=100):
+    """Vector Field Consistency와 Spectral Analysis 기반 Detector (100% GPU)"""
+    def __init__(self, attractor_learner, device='cuda'):
         self.attractor = attractor_learner
         self.device = device
-        self.chunk_size = chunk_size
         
-        # Reference data (already on GPU)
-        self.ref_points_gpu = self.attractor.reduced
-        self.mean_gpu = self.attractor.mean
-        self.cov_inv_gpu = self.attractor.cov_inv
+        if not self.attractor.fitted:
+            raise ValueError("AttractorLearner must be fitted before creating PatchDetector")
         
-        print(f"  PatchDetector initialized on {device} (Pure GPU)")
-        print(f"    Reference points: {self.ref_points_gpu.shape}")
-        print(f"    Chunk size: {chunk_size}")
+        print(f"  PatchDetector initialized on {device} (100% GPU)")
+        print(f"    Using Vector Field + Spectral Analysis")
         
     def detect(self, test_embedding_gpu, threshold=2.5):
         """
-        완전히 GPU에서 detection 수행
+        Vector field와 spectral analysis로 detection 수행 (모든 연산 GPU)
         
         Args:
-            test_embedding_gpu: [H, W, T, D] tensor on GPU
+            test_embedding_gpu: [H, W, L, D] tensor on GPU
             threshold: detection threshold
         
         Returns:
-            anomaly_map, patch_mask, hausdorff_map, mahalanobis_map (all numpy for visualization)
+            anomaly_map_gpu: [H, W] tensor on GPU
+            patch_mask_gpu: [H, W] boolean tensor on GPU
+            vector_map_gpu: [H, W] tensor on GPU
+            spectral_map_gpu: [H, W] tensor on GPU
         """
-        # PCA transform (GPU)
-        test_reduced = self.attractor.transform(test_embedding_gpu)  # [H, W, T, n_components]
-        H, W, T, D = test_reduced.shape
-        
-        # Reshape to [N, T, D] where N = H*W
-        trajectories = test_reduced.reshape(-1, T, D)
+        H, W, L, D = test_embedding_gpu.shape
+        trajectories = test_embedding_gpu.reshape(-1, L, D)  # [N, L, D] where N = H*W
         N = trajectories.shape[0]
         
-        # ===== 1. Hausdorff Distance (GPU) =====
-        hausdorff_scores = torch.zeros(N, device=self.device)
+        # ===== 1. Vector Field Consistency Score (GPU) =====
+        vectors = trajectories[:, 1:] - trajectories[:, :-1]  # [N, L-1, D]
+        magnitudes = torch.norm(vectors, dim=2)  # [N, L-1]
         
-        for start_idx in range(0, N, self.chunk_size):
-            end_idx = min(start_idx + self.chunk_size, N)
-            chunk = trajectories[start_idx:end_idx]
+        # Magnitude deviation from reference
+        magnitude_deviation = torch.abs(magnitudes - self.attractor.mean_magnitude) / (self.attractor.std_magnitude + 1e-8)
+        magnitude_score = magnitude_deviation.mean(dim=1)  # [N]
+        
+        # Direction consistency
+        if L > 2:
+            v1 = vectors[:, :-1]  # [N, L-2, D]
+            v2 = vectors[:, 1:]   # [N, L-2, D]
             
-            chunk_h_scores = []
-            for i in range(chunk.shape[0]):
-                traj = chunk[i]
-                distances = torch.cdist(traj, self.ref_points_gpu, p=2)
-                h_score = distances.min(dim=1)[0].max()
-                chunk_h_scores.append(h_score)
+            v1_norm = v1 / (torch.norm(v1, dim=2, keepdim=True) + 1e-8)
+            v2_norm = v2 / (torch.norm(v2, dim=2, keepdim=True) + 1e-8)
             
-            hausdorff_scores[start_idx:end_idx] = torch.stack(chunk_h_scores)
+            cos_sim = (v1_norm * v2_norm).sum(dim=2)  # [N, L-2]
+            direction_deviation = (1.0 - cos_sim)  # Lower is better (1 = smooth)
+            direction_score = direction_deviation.mean(dim=1)  # [N]
+            
+            # Combine magnitude and direction
+            vector_scores = 0.5 * magnitude_score + 0.5 * direction_score
+        else:
+            vector_scores = magnitude_score
         
-        # ===== 2. Mahalanobis Distance (GPU) =====
-        all_points = trajectories.reshape(-1, D)  # [N*T, D]
-        diff = all_points - self.mean_gpu
-        maha_dists = torch.sqrt(torch.sum(diff @ self.cov_inv_gpu * diff, dim=1))
-        maha_dists = maha_dists.reshape(N, T)
-        mahalanobis_scores = maha_dists.mean(dim=1)  # [N]
+        # ===== 2. Spectral Analysis Score (GPU) =====
+        fft_result = torch.fft.fft(trajectories, dim=1)  # [N, L, D]
+        power_spectrum = torch.abs(fft_result) ** 2  # [N, L, D]
         
-        # ===== 3. Log-likelihood (GPU) =====
-        log_probs = torch.zeros(N, device=self.device)
-        for i in range(N):
-            log_prob = self.attractor.kde.score_samples(trajectories[i]).mean()
-            log_probs[i] = log_prob
+        # Normalized spectral difference
+        spectral_diff = torch.abs(power_spectrum - self.attractor.mean_spectrum) / (self.attractor.std_spectrum + 1e-8)
+        spectral_scores = spectral_diff.mean(dim=[1, 2])  # [N]
         
-        # ===== 4. Combined Score (GPU) =====
-        anomaly_scores = (
-            0.4 * hausdorff_scores + 
-            0.4 * mahalanobis_scores - 
-            0.2 * log_probs
-        )
+        # ===== 3. Combined Score (GPU) =====
+        # Z-score normalization for combining
+        vector_mean = vector_scores.mean()
+        vector_std = vector_scores.std()
+        vector_scores_norm = (vector_scores - vector_mean) / (vector_std + 1e-8)
         
-        # Move to CPU only for visualization
-        anomaly_map = anomaly_scores.cpu().numpy().reshape(H, W)
-        hausdorff_map = hausdorff_scores.cpu().numpy().reshape(H, W)
-        mahalanobis_map = mahalanobis_scores.cpu().numpy().reshape(H, W)
+        spectral_mean = spectral_scores.mean()
+        spectral_std = spectral_scores.std()
+        spectral_scores_norm = (spectral_scores - spectral_mean) / (spectral_std + 1e-8)
         
-        # Threshold
-        patch_mask = anomaly_map > threshold
+        # Weighted combination (equal weights by default)
+        anomaly_scores = 0.5 * vector_scores_norm + 0.5 * spectral_scores_norm
         
-        return anomaly_map, patch_mask, hausdorff_map, mahalanobis_map
+        # ===== 4. Reshape to spatial maps (GPU) =====
+        anomaly_map_gpu = anomaly_scores.reshape(H, W)  # [H, W] on GPU
+        vector_map_gpu = vector_scores.reshape(H, W)    # [H, W] on GPU
+        spectral_map_gpu = spectral_scores.reshape(H, W)  # [H, W] on GPU
+        
+        # ===== 5. Thresholding (GPU) =====
+        patch_mask_gpu = anomaly_map_gpu > threshold  # [H, W] boolean tensor on GPU
+        
+        return anomaly_map_gpu, patch_mask_gpu, vector_map_gpu, spectral_map_gpu
