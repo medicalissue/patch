@@ -1,0 +1,47 @@
+# ===================================================================
+# Few-shot Image Patch Detection System Configuration
+# ===================================================================
+# Architecture:
+#   Phase 1: Few-shot Base Learning - Learn normal trajectory characteristics from ImageNet
+#   Phase 2: Few-shot Adaptation - Set adaptive threshold using domain-specific clean images
+#   Phase 3: Testing - Detect patches in test images
+# ===================================================================
+
+# Device configuration
+device:
+  cuda_id: 2  # CUDA device ID (0, 1, 2, etc.)
+  num_workers: 8  # DataLoader workers (adjust based on CPU cores)
+
+# Data configuration
+data:
+  # Phase 1: ImageNet data for learning base normal characteristics
+  imagenet:
+    path: /data/ImageNet/train  # Path to ImageNet training data
+    num_samples: 1000  # Number of samples to use for learning (-1 for all)
+    batch_size: 128  # Batch size for processing
+
+  # Phase 2: Domain-specific clean images for threshold adaptation
+  domain:
+    clean_path: images_without_patches  # Path to clean images of target domain
+    num_samples: 50  # Number of clean samples (-1 for all available)
+    batch_size: 32  # Batch size for processing
+
+  # Phase 3: Test images (with potential patches)
+  test:
+    patch_path: images_with_patches  # Path to test images
+    batch_size: 32  # Batch size for processing
+
+# Model configuration
+model:
+  spatial_resolution: 7  # Spatial resolution for feature extraction (7, 14, 28, 56)
+  feature_dim: 128  # Feature dimension after channel pooling
+
+# Detection configuration
+detection:
+  threshold_multiplier: 2.0  # Threshold = mean + k*std (higher = stricter)
+  detection_pixel_threshold: 0  # Minimum number of anomalous pixels to classify as detected
+
+# Output configuration
+output:
+  dir: detection_results  # Directory to save detection results
+  save_visualizations: true  # Whether to save visualization images

@@ -1,0 +1,16 @@
+# Few-shot Image Patch Detection System
+# Python dependencies
+
+# Deep Learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Configuration Management
+hydra-core>=1.3.0
+omegaconf>=2.3.0
+
+# Visualization
+matplotlib>=3.7.0
+
+# Image Processing
+pillow>=10.0.0
