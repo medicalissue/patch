@@ -193,12 +193,10 @@ def main(cfg: DictConfig):
 
     clean_test_folder = Path(cfg.data.domain.clean_path)
 
-    # Collect scores for each of the 6 metrics separately
-    clean_scores_spectral = []
+    # Collect scores for each of the 4 metrics separately
     clean_scores_wavelet = []
     clean_scores_stft = []
     clean_scores_hht = []
-    clean_scores_cqt = []
     clean_scores_sst = []
 
     if clean_test_folder.exists():
@@ -230,11 +228,9 @@ def main(cfg: DictConfig):
 
             # Dummy thresholds (we just want to collect scores)
             dummy_thresholds = {
-                'spectral': 999.0,
                 'wavelet': 999.0,
                 'stft': 999.0,
                 'hht': 999.0,
-                'cqt': 999.0,
                 'sst': 999.0
             }
 
@@ -247,16 +243,14 @@ def main(cfg: DictConfig):
 
                 # Collect scores for each metric
                 for b in range(embeddings_batch.shape[0]):
-                    anomaly_map, patch_mask, s_map, w_map, st_map, hht_map, cqt_map, sst_map, score_flags = temp_detector.detect(
+                    anomaly_map, patch_mask, w_map, st_map, hht_map, sst_map, score_flags = temp_detector.detect(
                         embeddings_batch[b], dummy_thresholds
                     )
 
                     # Collect max scores for each metric (GPU tensors)
-                    clean_scores_spectral.append(s_map.max())
                     clean_scores_wavelet.append(w_map.max())
                     clean_scores_stft.append(st_map.max())
                     clean_scores_hht.append(hht_map.max())
-                    clean_scores_cqt.append(cqt_map.max())
                     clean_scores_sst.append(sst_map.max())
 
                 if (batch_idx + 1) % 5 == 0 or (batch_idx + 1) == len(clean_test_loader):
@@ -266,11 +260,9 @@ def main(cfg: DictConfig):
 
             # Stack scores into tensors (Pure PyTorch on GPU)
             scores_dict = {
-                'spectral': torch.stack(clean_scores_spectral),
                 'wavelet': torch.stack(clean_scores_wavelet),
                 'stft': torch.stack(clean_scores_stft),
                 'hht': torch.stack(clean_scores_hht),
-                'cqt': torch.stack(clean_scores_cqt),
                 'sst': torch.stack(clean_scores_sst)
             }
 
@@ -327,8 +319,8 @@ def main(cfg: DictConfig):
             print(f"\n⚠ Warning: Clean test folder not found: {clean_test_folder}")
             print(f"  Using default thresholds")
             adaptive_thresholds = {
-                'spectral': 2.5, 'wavelet': 2.5, 'stft': 2.5,
-                'hht': 2.5, 'cqt': 2.5, 'sst': 2.5
+                'wavelet': 2.5, 'stft': 2.5,
+                'hht': 2.5, 'sst': 2.5
             }
             threshold_method = 'mean_std'
             formula = 'default'
@@ -338,8 +330,8 @@ def main(cfg: DictConfig):
             print(f"\n⚠ Warning: Error processing clean images: {e}")
             print(f"  Using default thresholds")
             adaptive_thresholds = {
-                'spectral': 2.5, 'wavelet': 2.5, 'stft': 2.5,
-                'hht': 2.5, 'cqt': 2.5, 'sst': 2.5
+                'wavelet': 2.5, 'stft': 2.5,
+                'hht': 2.5, 'sst': 2.5
             }
             threshold_method = 'mean_std'
             formula = 'default'
@@ -348,8 +340,8 @@ def main(cfg: DictConfig):
         print(f"\n⚠ Warning: Clean test folder not found: {clean_test_folder}")
         print(f"  Using default thresholds")
         adaptive_thresholds = {
-            'spectral': 2.5, 'wavelet': 2.5, 'stft': 2.5,
-            'hht': 2.5, 'cqt': 2.5, 'sst': 2.5
+            'wavelet': 2.5, 'stft': 2.5,
+            'hht': 2.5, 'sst': 2.5
         }
         threshold_method = 'mean_std'
         formula = 'default'
@@ -423,7 +415,7 @@ def main(cfg: DictConfig):
                 img_name = img_names[b]
 
                 # Detect patches with per-score thresholds
-                anomaly_map, patch_mask, s_map, w_map, st_map, hht_map, cqt_map, sst_map, score_flags = detector.detect(
+                anomaly_map, patch_mask, w_map, st_map, hht_map, sst_map, score_flags = detector.detect(
                     embeddings_batch[b], adaptive_thresholds
                 )
 
@@ -442,11 +434,9 @@ def main(cfg: DictConfig):
                     'name': img_name,
                     'anomaly_map': anomaly_map,
                     'patch_mask': patch_mask,
-                    's_map': s_map,
                     'w_map': w_map,
                     'st_map': st_map,
                     'hht_map': hht_map,
-                    'cqt_map': cqt_map,
                     'sst_map': sst_map,
                     'score_flags': score_flags,
                     'max_votes': max_votes,
@@ -457,7 +447,7 @@ def main(cfg: DictConfig):
                 # Visualize and save
                 if cfg.output.save_visualizations:
                     fig = visualize_results(
-                        img, anomaly_map, patch_mask, s_map, w_map, st_map, hht_map, cqt_map, sst_map,
+                        img, anomaly_map, patch_mask, w_map, st_map, hht_map, sst_map,
                         score_flags, img_name, adaptive_thresholds, cfg.detection.detection_pixel_threshold,
                         threshold_method, formula, cfg.detection.fusion_method, cfg.detection.voting_threshold
                     )

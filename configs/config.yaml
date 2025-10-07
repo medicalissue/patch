@@ -42,7 +42,7 @@ detection:
   fusion_method: voting
 
   # Voting threshold (number of scores that must be anomalous)
-  voting_threshold: 4  # At least 4 out of 6 scores (default: majority)
+  voting_threshold: 3  # At least 3 out of 4 scores (majority voting)
 
   # Per-score threshold method: 'mean_std', 'median_mad', 'percentile'
   score_threshold_method: median_mad
@@ -56,8 +56,8 @@ detection:
   # Parameters for 'percentile' method (per score)
   percentile: 95.0  # Use this percentile as threshold
 
-  # Weights for 'weighted_voting' method (6 scores: spectral, wavelet, stft, hht, cqt, sst)
-  score_weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  # Weights for 'weighted_voting' method (4 scores: wavelet, stft, hht, sst)
+  score_weights: [1.0, 1.0, 1.0, 1.0]
 
   detection_pixel_threshold: 0  # Minimum number of anomalous pixels to classify as detected
 

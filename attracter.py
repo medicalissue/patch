@@ -45,10 +45,6 @@ class AttractorLearner:
         self.device = device
         self.fitted = False
 
-        # Spectral analysis statistics (Z-score)
-        self.mean_spectrum = None
-        self.std_spectrum = None
-
         # Wavelet analysis statistics (Mahalanobis)
         self.mean_wavelet = None
         self.cov_inv_wavelet = None
@@ -60,10 +56,6 @@ class AttractorLearner:
         # HHT/EMD statistics (Mahalanobis)
         self.mean_hht = None
         self.cov_inv_hht = None
-
-        # CQT statistics (Mahalanobis)
-        self.mean_cqt = None
-        self.cov_inv_cqt = None
 
         # Synchrosqueezed STFT statistics (Mahalanobis)
         self.mean_sst = None
@@ -89,11 +81,9 @@ class AttractorLearner:
         print(f"  [Phase 1: Few-shot Base Learning]")
         print(f"  Learning normal trajectory characteristics from {len(clean_embeddings_gpu)} ImageNet samples...")
 
-        all_spectrums = []
         all_wavelets = []
         all_stfts = []
         all_hhts = []
-        all_cqts = []
         all_ssts = []
 
         for emb in clean_embeddings_gpu:
@@ -101,15 +91,7 @@ class AttractorLearner:
             # Reshape to [N, L, D] where N = H*W spatial locations
             trajectories = emb.reshape(-1, L, D)
 
-            # ===== 1. Spectral Statistics =====
-            # RFFT for each trajectory to analyze frequency components (real-valued input)
-            fft_result = torch.fft.rfft(trajectories, dim=1)  # [N, L//2+1, D]
-            power_spectrum = torch.abs(fft_result) ** 2  # [N, L//2+1, D]
-            # Log PSD for better dynamic range
-            log_psd = torch.log10(power_spectrum + 1e-10)  # [N, L//2+1, D]
-            all_spectrums.append(log_psd)
-
-            # ===== 2. Wavelet Statistics (Simple Haar-like wavelet) =====
+            # ===== 1. Wavelet Statistics (Simple Haar-like wavelet) =====
             # Detail coefficients (high-frequency components)
             if L >= 2:
                 half_L = L // 2
@@ -117,7 +99,7 @@ class AttractorLearner:
                 wavelet_coeff = torch.abs(detail)  # [N, L//2, D]
                 all_wavelets.append(wavelet_coeff)
 
-            # ===== 3. STFT Statistics =====
+            # ===== 2. STFT Statistics =====
             # Simple windowed RFFT (using half-window)
             window_size = max(2, L // 4)
             stft_powers = []
@@ -132,7 +114,7 @@ class AttractorLearner:
                 stft_power = torch.stack(stft_powers, dim=1)  # [N, num_windows, D]
                 all_stfts.append(stft_power)
 
-            # ===== 4. HHT/EMD Statistics (Simplified EMD) =====
+            # ===== 3. HHT/EMD Statistics (Simplified EMD) =====
             # Simplified Empirical Mode Decomposition: extract intrinsic mode functions
             # We use iterative sifting to extract IMFs
             N = trajectories.shape[0]
@@ -155,30 +137,7 @@ class AttractorLearner:
                 hht_features = torch.stack(imfs, dim=1)  # [N, num_imfs, D]
                 all_hhts.append(hht_features)
 
-            # ===== 5. CQT Statistics (Constant-Q Transform) =====
-            # CQT: logarithmically-spaced frequency bins
-            # Approximate using multiple FFTs with different window sizes
-            cqt_features = []
-            num_octaves = min(3, int(torch.log2(torch.tensor(L)).item()))
-
-            for octave in range(num_octaves):
-                win_size = max(2, L // (2 ** (octave + 1)))
-                if win_size >= 2:
-                    # Take center portion
-                    start_idx = (L - win_size) // 2
-                    window = trajectories[:, start_idx:start_idx+win_size, :]  # [N, win_size, D]
-
-                    # FFT on this window
-                    fft_result = torch.fft.rfft(window, dim=1)  # [N, win_size//2+1, D]
-                    octave_power = torch.abs(fft_result) ** 2
-                    log_octave_power = torch.log10(octave_power + 1e-10)
-                    cqt_features.append(log_octave_power.mean(dim=1))  # [N, D]
-
-            if cqt_features:
-                cqt_power = torch.stack(cqt_features, dim=1)  # [N, num_octaves, D]
-                all_cqts.append(cqt_power)
-
-            # ===== 6. Synchrosqueezed STFT (SST) =====
+            # ===== 4. Synchrosqueezed STFT (SST) =====
             # SST: Time-frequency reassignment for better localization
             # Simplified version: compute instantaneous frequency and reassign
             window_size = max(2, L // 4)
@@ -214,12 +173,6 @@ class AttractorLearner:
                 all_ssts.append(sst_power)
 
         # Concatenate all statistics across images
-        all_spectrums = torch.cat(all_spectrums, dim=0)  # [N_total, L//2+1, D]
-
-        # Compute mean and std for Z-score (band-wise)
-        self.mean_spectrum = all_spectrums.mean(dim=0)  # [L//2+1, D]
-        self.std_spectrum = all_spectrums.std(dim=0)    # [L//2+1, D]
-
         # Wavelet statistics
         if all_wavelets:
             all_wavelets = torch.cat(all_wavelets, dim=0)  # [N_total, L//2, D]
@@ -256,18 +209,6 @@ class AttractorLearner:
             cov += torch.eye(cov.shape[0], device=self.device) * 1e-6
             self.cov_inv_hht = torch.linalg.inv(cov)
 
-        # CQT statistics
-        if all_cqts:
-            all_cqts = torch.cat(all_cqts, dim=0)  # [N_total, num_octaves, D]
-            N = all_cqts.shape[0]
-            all_cqts_flat = all_cqts.reshape(N, -1)  # [N_total, num_octaves*D]
-            self.mean_cqt = all_cqts_flat.mean(dim=0)  # [num_octaves*D]
-
-            centered = all_cqts_flat - self.mean_cqt.unsqueeze(0)
-            cov = (centered.T @ centered) / (N - 1)
-            cov += torch.eye(cov.shape[0], device=self.device) * 1e-6
-            self.cov_inv_cqt = torch.linalg.inv(cov)
-
         # Synchrosqueezed STFT statistics
         if all_ssts:
             all_ssts = torch.cat(all_ssts, dim=0)  # [N_total, num_windows, D]
@@ -284,10 +225,6 @@ class AttractorLearner:
 
         # Print learned statistics
         print(f"  ✓ Normal trajectory characteristics learned:")
-        print(f"    Spectral (Z-score):")
-        print(f"      Shape:      {self.mean_spectrum.shape}")
-        print(f"      Mean:       {self.mean_spectrum.mean().item():.4f}")
-        print(f"      Std:        {self.std_spectrum.mean().item():.4f}")
         print(f"    Wavelet (Mahalanobis):")
         if self.mean_wavelet is not None:
             print(f"      Mean dim:   {self.mean_wavelet.shape[0]}")
@@ -300,10 +237,6 @@ class AttractorLearner:
         if self.mean_hht is not None:
             print(f"      Mean dim:   {self.mean_hht.shape[0]}")
             print(f"      Cov inv:    {self.cov_inv_hht.shape}")
-        print(f"    CQT (Mahalanobis):")
-        if self.mean_cqt is not None:
-            print(f"      Mean dim:   {self.mean_cqt.shape[0]}")
-            print(f"      Cov inv:    {self.cov_inv_cqt.shape}")
         print(f"    SST (Mahalanobis):")
         if self.mean_sst is not None:
             print(f"      Mean dim:   {self.mean_sst.shape[0]}")
