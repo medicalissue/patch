@@ -222,7 +222,7 @@ def main(cfg: DictConfig):
 
                 # Compute anomaly scores (use very high threshold to get scores only)
                 for b in range(embeddings_batch.shape[0]):
-                    anomaly_map, _, _, _, _, _, _ = detector.detect(embeddings_batch[b], threshold=999)
+                    anomaly_map, _, _, _, _, _, _, _ = detector.detect(embeddings_batch[b], threshold=999)
 
                     # Keep max score as GPU tensor
                     max_score = anomaly_map.max()
@@ -325,7 +325,7 @@ def main(cfg: DictConfig):
                 img_name = img_names[b]
 
                 # Detect patches
-                anomaly_map, patch_mask, v_map, s_map, c_map, e_map, a_map = detector.detect(
+                anomaly_map, patch_mask, s_map, w_map, st_map, ent_map, hf_map, sk_map = detector.detect(
                     embeddings_batch[b], threshold=adaptive_threshold
                 )
 
@@ -344,11 +344,12 @@ def main(cfg: DictConfig):
                     'name': img_name,
                     'anomaly_map': anomaly_map,
                     'patch_mask': patch_mask,
-                    'v_map': v_map,
                     's_map': s_map,
-                    'c_map': c_map,
-                    'e_map': e_map,
-                    'a_map': a_map,
+                    'w_map': w_map,
+                    'st_map': st_map,
+                    'ent_map': ent_map,
+                    'hf_map': hf_map,
+                    'sk_map': sk_map,
                     'max_score': max_score,
                     'detected_pixels': detected_pixels,
                     'is_detected': is_detected
@@ -357,7 +358,7 @@ def main(cfg: DictConfig):
                 # Visualize and save
                 if cfg.output.save_visualizations:
                     fig = visualize_results(
-                        img, anomaly_map, patch_mask, v_map, s_map, c_map, e_map, a_map,
+                        img, anomaly_map, patch_mask, s_map, w_map, st_map, ent_map, hf_map, sk_map,
                         img_name, adaptive_threshold, cfg.detection.detection_pixel_threshold
                     )
 

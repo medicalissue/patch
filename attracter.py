@@ -5,11 +5,7 @@ This module learns normal trajectory characteristics from a few ImageNet samples
 The learned statistics serve as reference for detecting anomalies.
 
 Key Statistics:
-  - Vector Field: magnitude and direction consistency
   - Spectral: frequency domain characteristics
-  - Curvature: trajectory smoothness
-  - Energy: kinetic and potential energy (global)
-  - Autocorrelation: temporal self-similarity (global)
 """
 
 import torch
@@ -25,19 +21,18 @@ class AttractorLearner:
     Attributes:
         device: Torch device (cuda or cpu)
         fitted: Whether the learner has been fitted
-        mean_magnitude: Mean vector magnitude in normal trajectories
-        std_magnitude: Std of vector magnitude
-        mean_direction: Mean direction consistency (cosine similarity)
-        mean_spectrum: Mean spectral power
+        mean_spectrum: Mean spectral power distribution
         std_spectrum: Std of spectral power
-        mean_curvature: Mean trajectory curvature
-        std_curvature: Std of trajectory curvature
-        mean_kinetic_energy: Mean kinetic energy (global trajectory)
-        std_kinetic_energy: Std of kinetic energy
-        mean_potential_energy: Mean potential energy (global trajectory)
-        std_potential_energy: Std of potential energy
-        mean_autocorr: Mean temporal autocorrelation
-        std_autocorr: Std of temporal autocorrelation
+        mean_wavelet: Mean wavelet coefficients
+        std_wavelet: Std of wavelet coefficients
+        mean_stft: Mean STFT power
+        std_stft: Std of STFT power
+        mean_spectral_entropy: Mean spectral entropy
+        std_spectral_entropy: Std of spectral entropy
+        mean_hf_ratio: Mean high-frequency ratio
+        std_hf_ratio: Std of high-frequency ratio
+        mean_spectral_skewness: Mean spectral skewness
+        std_spectral_skewness: Std of spectral skewness
     """
 
     def __init__(self, device='cuda'):
@@ -50,28 +45,29 @@ class AttractorLearner:
         self.device = device
         self.fitted = False
 
-        # Vector field statistics
-        self.mean_magnitude = None
-        self.std_magnitude = None
-        self.mean_direction = None
-
         # Spectral analysis statistics
         self.mean_spectrum = None
         self.std_spectrum = None
 
-        # Curvature statistics
-        self.mean_curvature = None
-        self.std_curvature = None
+        # Wavelet analysis statistics
+        self.mean_wavelet = None
+        self.std_wavelet = None
 
-        # Energy statistics (global)
-        self.mean_kinetic_energy = None
-        self.std_kinetic_energy = None
-        self.mean_potential_energy = None
-        self.std_potential_energy = None
+        # STFT statistics
+        self.mean_stft = None
+        self.std_stft = None
 
-        # Autocorrelation statistics (global)
-        self.mean_autocorr = None
-        self.std_autocorr = None
+        # Spectral entropy statistics
+        self.mean_spectral_entropy = None
+        self.std_spectral_entropy = None
+
+        # High-frequency ratio statistics
+        self.mean_hf_ratio = None
+        self.std_hf_ratio = None
+
+        # Spectral skewness statistics
+        self.mean_spectral_skewness = None
+        self.std_spectral_skewness = None
 
     def fit(self, clean_embeddings_gpu):
         """
@@ -92,146 +88,118 @@ class AttractorLearner:
         print(f"  [Phase 1: Few-shot Base Learning]")
         print(f"  Learning normal trajectory characteristics from {len(clean_embeddings_gpu)} ImageNet samples...")
 
-        all_magnitudes = []
-        all_directions = []
         all_spectrums = []
-        all_curvatures = []
-        all_kinetic_energies = []
-        all_potential_energies = []
-        all_autocorrs = []
+        all_wavelets = []
+        all_stfts = []
+        all_spectral_entropies = []
+        all_hf_ratios = []
+        all_spectral_skewnesses = []
 
         for emb in clean_embeddings_gpu:
             H, W, L, D = emb.shape
             # Reshape to [N, L, D] where N = H*W spatial locations
             trajectories = emb.reshape(-1, L, D)
 
-            # ===== 1. Vector Field Statistics =====
-            # Compute displacement vectors between consecutive time steps
-            vectors = trajectories[:, 1:] - trajectories[:, :-1]  # [N, L-1, D]
-
-            # Magnitude: ||v_t||
-            magnitudes = torch.norm(vectors, dim=2)  # [N, L-1]
-            all_magnitudes.append(magnitudes.reshape(-1))
-
-            # Direction consistency: cosine similarity between consecutive vectors
-            if L > 2:
-                v1 = vectors[:, :-1]  # [N, L-2, D]
-                v2 = vectors[:, 1:]   # [N, L-2, D]
-
-                # Normalize vectors
-                v1_norm = v1 / (torch.norm(v1, dim=2, keepdim=True) + 1e-8)
-                v2_norm = v2 / (torch.norm(v2, dim=2, keepdim=True) + 1e-8)
-
-                # Cosine similarity: v1 · v2
-                cos_sim = (v1_norm * v2_norm).sum(dim=2)  # [N, L-2]
-                all_directions.append(cos_sim.reshape(-1))
-
-            # ===== 2. Spectral Statistics =====
+            # ===== 1. Spectral Statistics =====
             # FFT for each trajectory to analyze frequency components
             fft_result = torch.fft.fft(trajectories, dim=1)  # [N, L, D]
             power_spectrum = torch.abs(fft_result) ** 2  # [N, L, D]
-            all_spectrums.append(power_spectrum.reshape(-1))
+            all_spectrums.append(power_spectrum)
 
-            # ===== 3. Curvature Statistics =====
-            # Second-order difference: acceleration
-            if L > 2:
-                acceleration = vectors[:, 1:] - vectors[:, :-1]  # [N, L-2, D]
-                curvature = torch.norm(acceleration, dim=2)  # [N, L-2]
-                all_curvatures.append(curvature.reshape(-1))
+            # ===== 2. Wavelet Statistics (Simple Haar-like wavelet) =====
+            # Detail coefficients (high-frequency components)
+            if L >= 2:
+                half_L = L // 2
+                detail = (trajectories[:, :half_L*2:2, :] - trajectories[:, 1:half_L*2:2, :]) / 2  # [N, L//2, D]
+                wavelet_coeff = torch.abs(detail)  # [N, L//2, D]
+                all_wavelets.append(wavelet_coeff)
 
-            # ===== 4. Energy Statistics (GLOBAL) =====
-            # Kinetic energy: sum of squared velocities (per trajectory)
-            kinetic_energy = (vectors ** 2).sum(dim=[1, 2])  # [N] - sum over time and features
-            all_kinetic_energies.append(kinetic_energy)
+            # ===== 3. STFT Statistics =====
+            # Simple windowed FFT (using half-window)
+            window_size = max(2, L // 4)
+            stft_powers = []
+            for i in range(0, L - window_size + 1, window_size // 2):
+                window = trajectories[:, i:i+window_size, :]  # [N, window_size, D]
+                window_fft = torch.fft.fft(window, dim=1)  # [N, window_size, D]
+                window_power = torch.abs(window_fft) ** 2  # [N, window_size, D]
+                stft_powers.append(window_power.mean(dim=1))  # [N, D]
+            if stft_powers:
+                stft_power = torch.stack(stft_powers, dim=1)  # [N, num_windows, D]
+                all_stfts.append(stft_power)
 
-            # Potential energy: sum of squared accelerations (per trajectory)
-            if L > 2:
-                potential_energy = (acceleration ** 2).sum(dim=[1, 2])  # [N]
-                all_potential_energies.append(potential_energy)
+            # ===== 4. Spectral Entropy =====
+            # Entropy of normalized power spectrum
+            power_norm = power_spectrum / (power_spectrum.sum(dim=1, keepdim=True) + 1e-8)  # [N, L, D]
+            entropy = -(power_norm * torch.log(power_norm + 1e-8)).sum(dim=1)  # [N, D]
+            all_spectral_entropies.append(entropy)
 
-            # ===== 5. Temporal Autocorrelation (GLOBAL) =====
-            # Measure temporal self-similarity across entire trajectory
-            # For each trajectory, compute autocorrelation at lag 1
-            if L > 1:
-                # Center the trajectory
-                traj_centered = trajectories - trajectories.mean(dim=1, keepdim=True)  # [N, L, D]
+            # ===== 5. High-Frequency Ratio =====
+            # Ratio of high-frequency power to total power
+            half_L = L // 2
+            high_freq_power = power_spectrum[:, half_L:, :].sum(dim=1)  # [N, D]
+            total_power = power_spectrum.sum(dim=1) + 1e-8  # [N, D]
+            hf_ratio = high_freq_power / total_power  # [N, D]
+            all_hf_ratios.append(hf_ratio)
 
-                # Autocorrelation at lag 1: corr between t and t+1
-                t1 = traj_centered[:, :-1, :]  # [N, L-1, D]
-                t2 = traj_centered[:, 1:, :]   # [N, L-1, D]
-
-                # Compute correlation per trajectory
-                numerator = (t1 * t2).sum(dim=[1, 2])  # [N]
-                denominator = torch.sqrt((t1 ** 2).sum(dim=[1, 2]) * (t2 ** 2).sum(dim=[1, 2])) + 1e-8
-                autocorr = numerator / denominator  # [N]
-                all_autocorrs.append(autocorr)
+            # ===== 6. Spectral Skewness =====
+            # Third moment of power spectrum
+            mean_power = power_spectrum.mean(dim=1, keepdim=True)  # [N, 1, D]
+            std_power = power_spectrum.std(dim=1, keepdim=True) + 1e-8  # [N, 1, D]
+            skewness = ((power_spectrum - mean_power) / std_power) ** 3  # [N, L, D]
+            skewness = skewness.mean(dim=1)  # [N, D]
+            all_spectral_skewnesses.append(skewness)
 
         # Concatenate all statistics across images
-        all_magnitudes = torch.cat(all_magnitudes, dim=0)
-        all_spectrums = torch.cat(all_spectrums, dim=0)
+        all_spectrums = torch.cat(all_spectrums, dim=0)  # [N_total, L, D]
 
-        # Compute mean and std for each statistic
-        self.mean_magnitude = all_magnitudes.mean()
-        self.std_magnitude = all_magnitudes.std()
+        # Compute mean and std spectrum
+        self.mean_spectrum = all_spectrums.mean(dim=0)  # [L, D]
+        self.std_spectrum = all_spectrums.std(dim=0)    # [L, D]
 
-        self.mean_spectrum = all_spectrums.mean()
-        self.std_spectrum = all_spectrums.std()
+        # Wavelet statistics
+        if all_wavelets:
+            all_wavelets = torch.cat(all_wavelets, dim=0)  # [N_total, L//2, D]
+            self.mean_wavelet = all_wavelets.mean(dim=0)  # [L//2, D]
+            self.std_wavelet = all_wavelets.std(dim=0)    # [L//2, D]
 
-        if len(all_directions) > 0:
-            all_directions = torch.cat(all_directions, dim=0)
-            self.mean_direction = all_directions.mean()
-        else:
-            self.mean_direction = torch.tensor(1.0, device=self.device)
+        # STFT statistics
+        if all_stfts:
+            all_stfts = torch.cat(all_stfts, dim=0)  # [N_total, num_windows, D]
+            self.mean_stft = all_stfts.mean(dim=0)  # [num_windows, D]
+            self.std_stft = all_stfts.std(dim=0)    # [num_windows, D]
 
-        if len(all_curvatures) > 0:
-            all_curvatures = torch.cat(all_curvatures, dim=0)
-            self.mean_curvature = all_curvatures.mean()
-            self.std_curvature = all_curvatures.std()
-        else:
-            self.mean_curvature = torch.tensor(0.0, device=self.device)
-            self.std_curvature = torch.tensor(1.0, device=self.device)
+        # Spectral entropy statistics
+        all_spectral_entropies = torch.cat(all_spectral_entropies, dim=0)  # [N_total, D]
+        self.mean_spectral_entropy = all_spectral_entropies.mean(dim=0)  # [D]
+        self.std_spectral_entropy = all_spectral_entropies.std(dim=0)    # [D]
 
-        # Energy statistics
-        if len(all_kinetic_energies) > 0:
-            all_kinetic_energies = torch.cat(all_kinetic_energies, dim=0)
-            self.mean_kinetic_energy = all_kinetic_energies.mean()
-            self.std_kinetic_energy = all_kinetic_energies.std()
-        else:
-            self.mean_kinetic_energy = torch.tensor(0.0, device=self.device)
-            self.std_kinetic_energy = torch.tensor(1.0, device=self.device)
+        # High-frequency ratio statistics
+        all_hf_ratios = torch.cat(all_hf_ratios, dim=0)  # [N_total, D]
+        self.mean_hf_ratio = all_hf_ratios.mean(dim=0)  # [D]
+        self.std_hf_ratio = all_hf_ratios.std(dim=0)    # [D]
 
-        if len(all_potential_energies) > 0:
-            all_potential_energies = torch.cat(all_potential_energies, dim=0)
-            self.mean_potential_energy = all_potential_energies.mean()
-            self.std_potential_energy = all_potential_energies.std()
-        else:
-            self.mean_potential_energy = torch.tensor(0.0, device=self.device)
-            self.std_potential_energy = torch.tensor(1.0, device=self.device)
-
-        # Autocorrelation statistics
-        if len(all_autocorrs) > 0:
-            all_autocorrs = torch.cat(all_autocorrs, dim=0)
-            self.mean_autocorr = all_autocorrs.mean()
-            self.std_autocorr = all_autocorrs.std()
-        else:
-            self.mean_autocorr = torch.tensor(0.0, device=self.device)
-            self.std_autocorr = torch.tensor(1.0, device=self.device)
+        # Spectral skewness statistics
+        all_spectral_skewnesses = torch.cat(all_spectral_skewnesses, dim=0)  # [N_total, D]
+        self.mean_spectral_skewness = all_spectral_skewnesses.mean(dim=0)  # [D]
+        self.std_spectral_skewness = all_spectral_skewnesses.std(dim=0)    # [D]
 
         self.fitted = True
 
         # Print learned statistics
         print(f"  ✓ Normal trajectory characteristics learned:")
-        print(f"    Vector Field:")
-        print(f"      Magnitude:  mean={self.mean_magnitude.item():.4f}, std={self.std_magnitude.item():.4f}")
-        print(f"      Direction:  mean_cos_sim={self.mean_direction.item():.4f}")
         print(f"    Spectral:")
-        print(f"      Power:      mean={self.mean_spectrum.item():.4f}, std={self.std_spectrum.item():.4f}")
-        print(f"    Curvature:")
-        print(f"      Curvature:  mean={self.mean_curvature.item():.4f}, std={self.std_curvature.item():.4f}")
-        print(f"    Energy (Global):")
-        print(f"      Kinetic:    mean={self.mean_kinetic_energy.item():.4f}, std={self.std_kinetic_energy.item():.4f}")
-        print(f"      Potential:  mean={self.mean_potential_energy.item():.4f}, std={self.std_potential_energy.item():.4f}")
-        print(f"    Autocorrelation (Global):")
-        print(f"      Lag-1:      mean={self.mean_autocorr.item():.4f}, std={self.std_autocorr.item():.4f}")
+        print(f"      Power:      mean={self.mean_spectrum.mean().item():.4f}, std={self.std_spectrum.mean().item():.4f}")
+        print(f"    Wavelet:")
+        if self.mean_wavelet is not None:
+            print(f"      Coeff:      mean={self.mean_wavelet.mean().item():.4f}, std={self.std_wavelet.mean().item():.4f}")
+        print(f"    STFT:")
+        if self.mean_stft is not None:
+            print(f"      Power:      mean={self.mean_stft.mean().item():.4f}, std={self.std_stft.mean().item():.4f}")
+        print(f"    Spectral Entropy:")
+        print(f"      Entropy:    mean={self.mean_spectral_entropy.mean().item():.4f}, std={self.std_spectral_entropy.mean().item():.4f}")
+        print(f"    High-Freq Ratio:")
+        print(f"      Ratio:      mean={self.mean_hf_ratio.mean().item():.4f}, std={self.std_hf_ratio.mean().item():.4f}")
+        print(f"    Spectral Skewness:")
+        print(f"      Skewness:   mean={self.mean_spectral_skewness.mean().item():.4f}, std={self.std_spectral_skewness.mean().item():.4f}")
 
         return self
