@@ -176,8 +176,8 @@ def main(cfg: DictConfig):
     attractor_learner = AttractorLearner(device=device)
     attractor_learner.fit(clean_embeddings_gpu)
 
-    # Create detector
-    detector = PatchDetector(attractor_learner, device=device)
+    # Create detector (will be updated after Phase 3)
+    detector = None
     print("\n✓ Phase 2 completed successfully")
 
     # =========================================================================
@@ -192,7 +192,14 @@ def main(cfg: DictConfig):
     phase3_start = time.time()
 
     clean_test_folder = Path(cfg.data.domain.clean_path)
-    clean_scores_gpu = []  # GPU tensor list
+
+    # Collect scores for each of the 6 metrics separately
+    clean_scores_spectral = []
+    clean_scores_wavelet = []
+    clean_scores_stft = []
+    clean_scores_hht = []
+    clean_scores_cqt = []
+    clean_scores_sst = []
 
     if clean_test_folder.exists():
         try:
@@ -213,6 +220,24 @@ def main(cfg: DictConfig):
 
             print(f"\n✓ Processing {len(clean_test_dataset)} clean images...")
 
+            # Create temporary detector for score calculation (no fusion needed yet)
+            temp_detector = PatchDetector(
+                attractor_learner,
+                device=device,
+                fusion_method='voting',
+                voting_threshold=1
+            )
+
+            # Dummy thresholds (we just want to collect scores)
+            dummy_thresholds = {
+                'spectral': 999.0,
+                'wavelet': 999.0,
+                'stft': 999.0,
+                'hht': 999.0,
+                'cqt': 999.0,
+                'sst': 999.0
+            }
+
             for batch_idx, (imgs, img_names) in enumerate(clean_test_loader):
                 imgs_gpu = imgs.to(device, non_blocking=True)
 
@@ -220,53 +245,124 @@ def main(cfg: DictConfig):
                 activations = extractor(imgs_gpu)
                 embeddings_batch = stack_trajectory(activations)  # [B, H, W, L, C]
 
-                # Compute anomaly scores (use very high threshold to get scores only)
+                # Collect scores for each metric
                 for b in range(embeddings_batch.shape[0]):
-                    anomaly_map, _, _, _, _, _, _, _ = detector.detect(embeddings_batch[b], threshold=999)
+                    anomaly_map, patch_mask, s_map, w_map, st_map, hht_map, cqt_map, sst_map, score_flags = temp_detector.detect(
+                        embeddings_batch[b], dummy_thresholds
+                    )
 
-                    # Keep max score as GPU tensor
-                    max_score = anomaly_map.max()
-                    clean_scores_gpu.append(max_score)
+                    # Collect max scores for each metric (GPU tensors)
+                    clean_scores_spectral.append(s_map.max())
+                    clean_scores_wavelet.append(w_map.max())
+                    clean_scores_stft.append(st_map.max())
+                    clean_scores_hht.append(hht_map.max())
+                    clean_scores_cqt.append(cqt_map.max())
+                    clean_scores_sst.append(sst_map.max())
 
                 if (batch_idx + 1) % 5 == 0 or (batch_idx + 1) == len(clean_test_loader):
                     processed = min((batch_idx + 1) * cfg.data.domain.batch_size, len(clean_test_dataset))
                     print(f"  Processed: {processed}/{len(clean_test_dataset)} images "
                           f"({100*processed/len(clean_test_dataset):.1f}%)")
 
-            # Calculate adaptive threshold (Pure PyTorch on GPU)
-            clean_scores_tensor = torch.stack(clean_scores_gpu)  # [N] tensor on GPU
-            mean_score = clean_scores_tensor.mean()
-            std_score = clean_scores_tensor.std()
+            # Stack scores into tensors (Pure PyTorch on GPU)
+            scores_dict = {
+                'spectral': torch.stack(clean_scores_spectral),
+                'wavelet': torch.stack(clean_scores_wavelet),
+                'stft': torch.stack(clean_scores_stft),
+                'hht': torch.stack(clean_scores_hht),
+                'cqt': torch.stack(clean_scores_cqt),
+                'sst': torch.stack(clean_scores_sst)
+            }
 
-            adaptive_threshold = (mean_score + cfg.detection.threshold_multiplier * std_score).item()
+            # Compute per-score thresholds based on selected method
+            threshold_method = cfg.detection.score_threshold_method
+            adaptive_thresholds = {}
+
+            # Helper function to compute threshold for a single score
+            def compute_threshold(scores_tensor, method):
+                if method == 'mean_std':
+                    mean_score = scores_tensor.mean()
+                    std_score = scores_tensor.std()
+                    return (mean_score + cfg.detection.threshold_multiplier * std_score).item()
+
+                elif method == 'median_mad':
+                    median_score = scores_tensor.median()
+                    mad = (scores_tensor - median_score).abs().median()
+                    return (median_score + cfg.detection.mad_multiplier * mad).item()
+
+                elif method == 'percentile':
+                    sorted_scores = torch.sort(scores_tensor)[0]
+                    percentile_idx = int(len(sorted_scores) * cfg.detection.percentile / 100.0)
+                    percentile_idx = min(percentile_idx, len(sorted_scores) - 1)
+                    return sorted_scores[percentile_idx].item()
+
+                else:
+                    raise ValueError(f"Unknown threshold method: {method}")
+
+            # Compute threshold for each score
+            for score_name, scores_tensor in scores_dict.items():
+                adaptive_thresholds[score_name] = compute_threshold(scores_tensor, threshold_method)
+
+            # Formula for display
+            if threshold_method == 'mean_std':
+                formula = f"mean + {cfg.detection.threshold_multiplier} * std"
+            elif threshold_method == 'median_mad':
+                formula = f"median + {cfg.detection.mad_multiplier} * MAD"
+            elif threshold_method == 'percentile':
+                formula = f"{cfg.detection.percentile}th percentile"
 
             phase3_time = time.time() - phase3_start
 
             print(f"\n✓ Threshold adaptation completed in {phase3_time:.2f}s")
-            print(f"\nClean image statistics:")
-            print(f"  Mean score: {mean_score.item():.4f}")
-            print(f"  Std score:  {std_score.item():.4f}")
-            print(f"  Range:      [{clean_scores_tensor.min().item():.4f}, "
-                  f"{clean_scores_tensor.max().item():.4f}]")
-            print(f"\nAdaptive threshold: {adaptive_threshold:.4f}")
-            print(f"  Formula: mean + {cfg.detection.threshold_multiplier} * std")
+            print(f"\nPer-Score Adaptive Thresholds:")
+            print(f"  Method:  {threshold_method}")
+            print(f"  Formula: {formula}")
+            print(f"\n  Score Thresholds:")
+            for score_name, threshold_value in adaptive_thresholds.items():
+                score_tensor = scores_dict[score_name]
+                print(f"    {score_name:12s}: {threshold_value:.4f} "
+                      f"(range: [{score_tensor.min().item():.4f}, {score_tensor.max().item():.4f}])")
 
         except FileNotFoundError:
             print(f"\n⚠ Warning: Clean test folder not found: {clean_test_folder}")
-            print(f"  Using default threshold: 2.5")
-            adaptive_threshold = 2.5
+            print(f"  Using default thresholds")
+            adaptive_thresholds = {
+                'spectral': 2.5, 'wavelet': 2.5, 'stft': 2.5,
+                'hht': 2.5, 'cqt': 2.5, 'sst': 2.5
+            }
+            threshold_method = 'mean_std'
+            formula = 'default'
             phase3_time = 0
 
         except Exception as e:
             print(f"\n⚠ Warning: Error processing clean images: {e}")
-            print(f"  Using default threshold: 2.5")
-            adaptive_threshold = 2.5
+            print(f"  Using default thresholds")
+            adaptive_thresholds = {
+                'spectral': 2.5, 'wavelet': 2.5, 'stft': 2.5,
+                'hht': 2.5, 'cqt': 2.5, 'sst': 2.5
+            }
+            threshold_method = 'mean_std'
+            formula = 'default'
             phase3_time = 0
     else:
         print(f"\n⚠ Warning: Clean test folder not found: {clean_test_folder}")
-        print(f"  Using default threshold: 2.5")
-        adaptive_threshold = 2.5
+        print(f"  Using default thresholds")
+        adaptive_thresholds = {
+            'spectral': 2.5, 'wavelet': 2.5, 'stft': 2.5,
+            'hht': 2.5, 'cqt': 2.5, 'sst': 2.5
+        }
+        threshold_method = 'mean_std'
+        formula = 'default'
         phase3_time = 0
+
+    # Create detector with fusion parameters
+    detector = PatchDetector(
+        attractor_learner,
+        device=device,
+        fusion_method=cfg.detection.fusion_method,
+        voting_threshold=cfg.detection.voting_threshold,
+        score_weights=cfg.detection.score_weights
+    )
 
     print("\n✓ Phase 3 completed successfully")
 
@@ -277,7 +373,9 @@ def main(cfg: DictConfig):
     print("Detecting patches in test images")
     print(f"Test images path: {cfg.data.test.patch_path}")
     print(f"Batch size: {cfg.data.test.batch_size}")
-    print(f"Detection threshold: {adaptive_threshold:.4f}")
+    print(f"Fusion method: {cfg.detection.fusion_method}")
+    if cfg.detection.fusion_method == 'voting':
+        print(f"Voting threshold: {cfg.detection.voting_threshold}/6 scores")
     print(f"Output directory: {cfg.output.dir}")
 
     phase4_start = time.time()
@@ -324,19 +422,19 @@ def main(cfg: DictConfig):
                 img = imgs[b]
                 img_name = img_names[b]
 
-                # Detect patches
-                anomaly_map, patch_mask, s_map, w_map, st_map, ent_map, hf_map, sk_map = detector.detect(
-                    embeddings_batch[b], threshold=adaptive_threshold
+                # Detect patches with per-score thresholds
+                anomaly_map, patch_mask, s_map, w_map, st_map, hht_map, cqt_map, sst_map, score_flags = detector.detect(
+                    embeddings_batch[b], adaptive_thresholds
                 )
 
                 detected_pixels = patch_mask.sum().item()
-                max_score = anomaly_map.max().item()
+                max_votes = anomaly_map.max().item()
 
                 is_detected = detected_pixels > cfg.detection.detection_pixel_threshold
                 status = "✓ DETECTED" if is_detected else "✗ CLEAN"
 
                 print(f"  [{image_counter}/{len(patch_dataset)}] {img_name:30s} | "
-                      f"Score: {max_score:.3f} | Pixels: {detected_pixels:4d} | {status}")
+                      f"Votes: {max_votes:.1f} | Pixels: {detected_pixels:4d} | {status}")
 
                 # Store results
                 results.append({
@@ -347,10 +445,11 @@ def main(cfg: DictConfig):
                     's_map': s_map,
                     'w_map': w_map,
                     'st_map': st_map,
-                    'ent_map': ent_map,
-                    'hf_map': hf_map,
-                    'sk_map': sk_map,
-                    'max_score': max_score,
+                    'hht_map': hht_map,
+                    'cqt_map': cqt_map,
+                    'sst_map': sst_map,
+                    'score_flags': score_flags,
+                    'max_votes': max_votes,
                     'detected_pixels': detected_pixels,
                     'is_detected': is_detected
                 })
@@ -358,8 +457,9 @@ def main(cfg: DictConfig):
                 # Visualize and save
                 if cfg.output.save_visualizations:
                     fig = visualize_results(
-                        img, anomaly_map, patch_mask, s_map, w_map, st_map, ent_map, hf_map, sk_map,
-                        img_name, adaptive_threshold, cfg.detection.detection_pixel_threshold
+                        img, anomaly_map, patch_mask, s_map, w_map, st_map, hht_map, cqt_map, sst_map,
+                        score_flags, img_name, adaptive_thresholds, cfg.detection.detection_pixel_threshold,
+                        threshold_method, formula, cfg.detection.fusion_method, cfg.detection.voting_threshold
                     )
 
                     output_path = output_dir / f'result_{Path(img_name).stem}.png'
@@ -395,12 +495,12 @@ def main(cfg: DictConfig):
     print(f"  Clean:    {len(results) - total_detected}")
     print(f"  Rate:     {detection_rate:.1f}%")
 
-    print(f"\nScore Statistics:")
+    print(f"\nVote Statistics:")
     if len(results) > 0:
-        scores = [r['max_score'] for r in results]
-        print(f"  Min:  {min(scores):.4f}")
-        print(f"  Max:  {max(scores):.4f}")
-        print(f"  Mean: {sum(scores)/len(scores):.4f}")
+        votes = [r['max_votes'] for r in results]
+        print(f"  Min:  {min(votes):.2f}")
+        print(f"  Max:  {max(votes):.2f}")
+        print(f"  Mean: {sum(votes)/len(votes):.2f}")
 
     # Timing breakdown
     print(f"\n{'=' * 80}")

@@ -28,36 +28,43 @@ def denormalize_image(img_tensor):
 
 def visualize_results(image, anomaly_map_gpu, patch_mask_gpu,
                      spectral_map_gpu, wavelet_map_gpu, stft_map_gpu,
-                     entropy_map_gpu, hf_ratio_map_gpu, skewness_map_gpu,
-                     image_name="", threshold=None, detection_pixel_threshold=0):
+                     hht_map_gpu, cqt_map_gpu, sst_map_gpu,
+                     score_flags, image_name="", thresholds=None, detection_pixel_threshold=0,
+                     threshold_method="mean_std", threshold_formula="",
+                     fusion_method="voting", voting_threshold=4):
     """
-    Visualize Few-shot detection results
+    Visualize Few-shot detection results with per-score thresholds and voting
 
     Creates a comprehensive visualization showing:
     - Original image
-    - Combined anomaly score map
+    - Vote count map (number of scores that flagged each pixel as anomalous)
     - Detection overlay
-    - Component score maps (spectral, wavelet, STFT, entropy, HF ratio, skewness)
-    - Detection metrics and statistics
+    - Component score maps with thresholds and flagged pixel counts
+    - Detection metrics and per-score statistics
 
     This visualization supports the Few-shot detection approach:
       Phase 1: Base learning from ImageNet (learned statistics)
-      Phase 2: Adaptive threshold from domain clean images
-      Phase 3: Detection on test images
+      Phase 2: Per-score adaptive thresholds from domain clean images
+      Phase 3: Detection using voting fusion
 
     Args:
         image: [C, H, W] tensor - original image
-        anomaly_map_gpu: [H, W] tensor on GPU - combined anomaly scores
+        anomaly_map_gpu: [H, W] tensor on GPU - vote count map
         patch_mask_gpu: [H, W] boolean tensor on GPU - detection mask
         spectral_map_gpu: [H, W] tensor on GPU - spectral scores
         wavelet_map_gpu: [H, W] tensor on GPU - wavelet scores
         stft_map_gpu: [H, W] tensor on GPU - STFT scores
-        entropy_map_gpu: [H, W] tensor on GPU - spectral entropy scores
-        hf_ratio_map_gpu: [H, W] tensor on GPU - high-frequency ratio scores
-        skewness_map_gpu: [H, W] tensor on GPU - spectral skewness scores
+        hht_map_gpu: [H, W] tensor on GPU - HHT/EMD scores
+        cqt_map_gpu: [H, W] tensor on GPU - CQT scores
+        sst_map_gpu: [H, W] tensor on GPU - Synchrosqueezed STFT scores
+        score_flags: dict - per-score binary flags [H, W] showing which pixels were flagged
         image_name: str - image filename
-        threshold: float - detection threshold (from Phase 2 adaptation)
+        thresholds: dict - per-score thresholds {'spectral': t1, ..., 'sst': t6}
         detection_pixel_threshold: int - minimum pixels for positive detection
+        threshold_method: str - threshold calculation method ('mean_std', 'median_mad', 'percentile')
+        threshold_formula: str - formula description for threshold calculation
+        fusion_method: str - score fusion method ('voting', 'weighted_voting', 'all', 'any')
+        voting_threshold: int - number of scores that must be anomalous (for 'voting' method, default 4/6)
 
     Returns:
         matplotlib figure object
@@ -69,9 +76,9 @@ def visualize_results(image, anomaly_map_gpu, patch_mask_gpu,
     spectral_map = spectral_map_gpu.cpu().numpy()
     wavelet_map = wavelet_map_gpu.cpu().numpy()
     stft_map = stft_map_gpu.cpu().numpy()
-    entropy_map = entropy_map_gpu.cpu().numpy()
-    hf_ratio_map = hf_ratio_map_gpu.cpu().numpy()
-    skewness_map = skewness_map_gpu.cpu().numpy()
+    hht_map = hht_map_gpu.cpu().numpy()
+    cqt_map = cqt_map_gpu.cpu().numpy()
+    sst_map = sst_map_gpu.cpu().numpy()
 
     fig = plt.figure(figsize=(20, 16))
     gs = fig.add_gridspec(4, 3, hspace=0.3, wspace=0.3)
@@ -86,19 +93,16 @@ def visualize_results(image, anomaly_map_gpu, patch_mask_gpu,
     
     ax2 = fig.add_subplot(gs[0, 1])
     im1 = ax2.imshow(anomaly_map, cmap='hot', interpolation='bilinear')
-    
-    threshold_text = f'Threshold: {threshold:.2f}' if threshold is not None else ''
-    title_text = f'Anomaly Score Map\nMax: {anomaly_map.max():.2f}, Mean: {anomaly_map.mean():.2f}'
-    if threshold is not None:
-        title_text += f'\n{threshold_text}'
+
+    title_text = f'Vote Count Map'
+    if fusion_method == 'voting':
+        title_text += f' ({voting_threshold}/6 votes needed)'
+    title_text += f'\nMax: {anomaly_map.max():.1f}, Mean: {anomaly_map.mean():.1f}'
     ax2.set_title(title_text, fontsize=10, fontweight='bold')
     ax2.axis('off')
-    
+
     cbar1 = plt.colorbar(im1, ax=ax2, fraction=0.046, pad=0.04)
     cbar1.ax.tick_params(labelsize=9)
-    
-    if threshold is not None and threshold <= anomaly_map.max():
-        cbar1.ax.axhline(y=threshold, color='cyan', linestyle='--', linewidth=2)
     
     ax3 = fig.add_subplot(gs[0, 2])
     ax3.imshow(img_display)
@@ -120,52 +124,69 @@ def visualize_results(image, anomaly_map_gpu, patch_mask_gpu,
                  fontsize=10, fontweight='bold')
     ax3.axis('off')
     
-    # Row 2: Component scores (Spectral, Wavelet, STFT)
+    # Row 2 & 3: Component scores (6 scores: Spectral, Wavelet, STFT, HHT, CQT, SST)
+    # Get thresholds (handle both dict and None)
+    spectral_th = thresholds.get('spectral', 0) if thresholds else 0
+    wavelet_th = thresholds.get('wavelet', 0) if thresholds else 0
+    stft_th = thresholds.get('stft', 0) if thresholds else 0
+    hht_th = thresholds.get('hht', 0) if thresholds else 0
+    cqt_th = thresholds.get('cqt', 0) if thresholds else 0
+    sst_th = thresholds.get('sst', 0) if thresholds else 0
+
+    # Count flagged pixels
+    spectral_flags = score_flags['spectral'].cpu().numpy()
+    wavelet_flags = score_flags['wavelet'].cpu().numpy()
+    stft_flags = score_flags['stft'].cpu().numpy()
+    hht_flags = score_flags['hht'].cpu().numpy()
+    cqt_flags = score_flags['cqt'].cpu().numpy()
+    sst_flags = score_flags['sst'].cpu().numpy()
+
+    # Row 2: First 3 scores
     ax4 = fig.add_subplot(gs[1, 0])
     im2 = ax4.imshow(spectral_map, cmap='plasma', interpolation='bilinear')
-    ax4.set_title(f'Spectral Score\nMax: {spectral_map.max():.2f}, Mean: {spectral_map.mean():.2f}',
-                 fontsize=10, fontweight='bold')
+    ax4.set_title(f'Spectral (Z)\nMax: {spectral_map.max():.2f} | Th: {spectral_th:.2f} | Flagged: {spectral_flags.sum()}',
+                 fontsize=9, fontweight='bold')
     ax4.axis('off')
     cbar2 = plt.colorbar(im2, ax=ax4, fraction=0.046, pad=0.04)
     cbar2.ax.tick_params(labelsize=9)
 
     ax5 = fig.add_subplot(gs[1, 1])
     im3 = ax5.imshow(wavelet_map, cmap='viridis', interpolation='bilinear')
-    ax5.set_title(f'Wavelet Score\nMax: {wavelet_map.max():.2f}, Mean: {wavelet_map.mean():.2f}',
-                 fontsize=10, fontweight='bold')
+    ax5.set_title(f'Wavelet (M)\nMax: {wavelet_map.max():.2f} | Th: {wavelet_th:.2f} | Flagged: {wavelet_flags.sum()}',
+                 fontsize=9, fontweight='bold')
     ax5.axis('off')
     cbar3 = plt.colorbar(im3, ax=ax5, fraction=0.046, pad=0.04)
     cbar3.ax.tick_params(labelsize=9)
 
     ax6 = fig.add_subplot(gs[1, 2])
     im4 = ax6.imshow(stft_map, cmap='coolwarm', interpolation='bilinear')
-    ax6.set_title(f'STFT Score\nMax: {stft_map.max():.2f}, Mean: {stft_map.mean():.2f}',
-                 fontsize=10, fontweight='bold')
+    ax6.set_title(f'STFT (M)\nMax: {stft_map.max():.2f} | Th: {stft_th:.2f} | Flagged: {stft_flags.sum()}',
+                 fontsize=9, fontweight='bold')
     ax6.axis('off')
     cbar4 = plt.colorbar(im4, ax=ax6, fraction=0.046, pad=0.04)
     cbar4.ax.tick_params(labelsize=9)
 
-    # Row 3: More component scores (Entropy, HF Ratio, Skewness)
+    # Row 3: Last 3 scores
     ax7 = fig.add_subplot(gs[2, 0])
-    im5 = ax7.imshow(entropy_map, cmap='inferno', interpolation='bilinear')
-    ax7.set_title(f'Spectral Entropy Score\nMax: {entropy_map.max():.2f}, Mean: {entropy_map.mean():.2f}',
-                 fontsize=10, fontweight='bold')
+    im5 = ax7.imshow(hht_map, cmap='inferno', interpolation='bilinear')
+    ax7.set_title(f'HHT/EMD (M)\nMax: {hht_map.max():.2f} | Th: {hht_th:.2f} | Flagged: {hht_flags.sum()}',
+                 fontsize=9, fontweight='bold')
     ax7.axis('off')
     cbar5 = plt.colorbar(im5, ax=ax7, fraction=0.046, pad=0.04)
     cbar5.ax.tick_params(labelsize=9)
 
     ax8 = fig.add_subplot(gs[2, 1])
-    im6 = ax8.imshow(hf_ratio_map, cmap='magma', interpolation='bilinear')
-    ax8.set_title(f'High-Freq Ratio Score\nMax: {hf_ratio_map.max():.2f}, Mean: {hf_ratio_map.mean():.2f}',
-                 fontsize=10, fontweight='bold')
+    im6 = ax8.imshow(cqt_map, cmap='magma', interpolation='bilinear')
+    ax8.set_title(f'CQT (M)\nMax: {cqt_map.max():.2f} | Th: {cqt_th:.2f} | Flagged: {cqt_flags.sum()}',
+                 fontsize=9, fontweight='bold')
     ax8.axis('off')
     cbar6 = plt.colorbar(im6, ax=ax8, fraction=0.046, pad=0.04)
     cbar6.ax.tick_params(labelsize=9)
 
     ax9 = fig.add_subplot(gs[2, 2])
-    im7 = ax9.imshow(skewness_map, cmap='cividis', interpolation='bilinear')
-    ax9.set_title(f'Spectral Skewness Score\nMax: {skewness_map.max():.2f}, Mean: {skewness_map.mean():.2f}',
-                 fontsize=10, fontweight='bold')
+    im7 = ax9.imshow(sst_map, cmap='cividis', interpolation='bilinear')
+    ax9.set_title(f'SST (M)\nMax: {sst_map.max():.2f} | Th: {sst_th:.2f} | Flagged: {sst_flags.sum()}',
+                 fontsize=9, fontweight='bold')
     ax9.axis('off')
     cbar7 = plt.colorbar(im7, ax=ax9, fraction=0.046, pad=0.04)
     cbar7.ax.tick_params(labelsize=9)
@@ -175,7 +196,6 @@ def visualize_results(image, anomaly_map_gpu, patch_mask_gpu,
     ax10.axis('off')
 
     spatial_res = f"{anomaly_map.shape[0]}×{anomaly_map.shape[1]}"
-    threshold_str = f"{threshold:.3f}" if threshold is not None else "N/A"
 
     if detected_pixels > detection_pixel_threshold:
         status = "🔴 ANOMALY DETECTED"
@@ -186,30 +206,43 @@ def visualize_results(image, anomaly_map_gpu, patch_mask_gpu,
         status_color = 'green'
         bg_color = 'lightgreen'
 
+    # Format thresholds
+    threshold_lines = []
+    for name in ['spectral', 'wavelet', 'stft', 'hht', 'cqt', 'sst']:
+        th_val = thresholds.get(name, 0) if thresholds else 0
+        threshold_lines.append(f"  {name:12s}: {th_val:.3f}")
+
     metrics_text = f"""
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  FEW-SHOT PATCH DETECTION RESULTS
+  FEW-SHOT PATCH DETECTION RESULTS (Per-Score Thresholds + Voting)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Detection Method: Few-shot Learning with Absolute Deviation
+Detection Method: Few-shot Learning (Z-score + Mahalanobis) with Voting Fusion
   Phase 1: Base Learning      → Learn normal trajectory characteristics from ImageNet
-  Phase 2: Threshold Adaptation → Set adaptive threshold using domain-specific clean images
-  Phase 3: Testing            → Detect patches using absolute deviation comparison
+  Phase 2: Threshold Adaptation → Set per-score adaptive thresholds using domain clean images
+  Phase 3: Testing            → Detect patches using per-score thresholds + {fusion_method}
 
 Spatial Resolution: {spatial_res} ({anomaly_map.size} pixels)
 
-Anomaly Scores:
-  Max:  {anomaly_map.max():.4f}  │  Mean: {anomaly_map.mean():.4f}  │  Std: {anomaly_map.std():.4f}
+Vote Count Map:
+  Max Votes:  {anomaly_map.max():.1f}/6  │  Mean: {anomaly_map.mean():.1f}  │  Std: {anomaly_map.std():.1f}
 
-Adaptive Threshold: {threshold_str} (from Phase 2)
+Fusion Method: {fusion_method}
+  {'Voting Threshold: ' + str(voting_threshold) + '/6 scores must be anomalous' if fusion_method == 'voting' else ''}
+
+Per-Score Adaptive Thresholds ({threshold_method}):
+  Method:  {threshold_method}
+  Formula: {threshold_formula}
+{chr(10).join(threshold_lines)}
 
 Detection Results:
   Detected Pixels: {detected_pixels} / {patch_mask.size} ({detection_rate:.2f}%)
   Status: {status}
 
-Component Scores (Max - Absolute Deviation):
-  Spectral: {spectral_map.max():.3f}  │  Wavelet: {wavelet_map.max():.3f}  │  STFT: {stft_map.max():.3f}
-  Entropy: {entropy_map.max():.3f}  │  HF Ratio: {hf_ratio_map.max():.3f}  │  Skewness: {skewness_map.max():.3f}
+Component Scores (Max / Flagged Pixels):
+  Spectral (Z):  {spectral_map.max():.3f} / {spectral_flags.sum()}  │  Wavelet (M):  {wavelet_map.max():.3f} / {wavelet_flags.sum()}
+  STFT (M):      {stft_map.max():.3f} / {stft_flags.sum()}           │  HHT/EMD (M):  {hht_map.max():.3f} / {hht_flags.sum()}
+  CQT (M):       {cqt_map.max():.3f} / {cqt_flags.sum()}            │  SST (M):      {sst_map.max():.3f} / {sst_flags.sum()}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     """

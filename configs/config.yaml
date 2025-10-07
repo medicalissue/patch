@@ -38,7 +38,27 @@ model:
 
 # Detection configuration
 detection:
-  threshold_multiplier: 2.0  # Threshold = mean + k*std (higher = stricter)
+  # Score fusion method: 'voting', 'weighted_voting', 'all', 'any'
+  fusion_method: voting
+
+  # Voting threshold (number of scores that must be anomalous)
+  voting_threshold: 4  # At least 4 out of 6 scores (default: majority)
+
+  # Per-score threshold method: 'mean_std', 'median_mad', 'percentile'
+  score_threshold_method: median_mad
+
+  # Parameters for 'mean_std' method (per score)
+  threshold_multiplier: 2.0  # Threshold = mean + k*std
+
+  # Parameters for 'median_mad' method (per score)
+  mad_multiplier: 3.0  # Threshold = median + c*MAD (robust to outliers)
+
+  # Parameters for 'percentile' method (per score)
+  percentile: 95.0  # Use this percentile as threshold
+
+  # Weights for 'weighted_voting' method (6 scores: spectral, wavelet, stft, hht, cqt, sst)
+  score_weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
   detection_pixel_threshold: 0  # Minimum number of anomalous pixels to classify as detected
 
 # Output configuration
