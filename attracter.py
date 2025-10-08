@@ -9,6 +9,10 @@ Key Statistics:
 """
 
 import torch
+import pickle
+from pathlib import Path
+import hashlib
+import json
 
 
 class AttractorLearner:
@@ -61,16 +65,23 @@ class AttractorLearner:
         self.mean_sst = None
         self.cov_inv_sst = None
 
+        # Incremental statistics (Welford's algorithm)
+        self.n_samples = 0
+        self.M2_wavelet = None  # Sum of squared differences for covariance
+        self.M2_stft = None
+        self.M2_hht = None
+        self.M2_sst = None
 
-    def fit(self, clean_embeddings_gpu):
+
+    def partial_fit(self, clean_embeddings_gpu):
         """
-        Learn normal trajectory characteristics from clean images
+        Incrementally update normal trajectory characteristics from clean images
 
-        This implements Phase 1 (Few-shot Base Learning):
-        Extract statistical characteristics of normal trajectories from ImageNet.
+        This method uses batch-wise Welford's algorithm to compute mean and covariance
+        without loading all data into memory at once. GPU-optimized for speed.
 
         Args:
-            clean_embeddings_gpu: List of [H, W, L, D] tensors on GPU
+            clean_embeddings_gpu: List of [H, W, L, D] tensors on GPU (mini-batch)
                                  H, W: spatial dimensions
                                  L: trajectory length (number of layers)
                                  D: feature dimension
@@ -78,148 +89,202 @@ class AttractorLearner:
         Returns:
             self: For method chaining
         """
-        print(f"  [Phase 1: Few-shot Base Learning]")
-        print(f"  Learning normal trajectory characteristics from {len(clean_embeddings_gpu)} ImageNet samples...")
-
         all_wavelets = []
         all_stfts = []
         all_hhts = []
         all_ssts = []
 
+        # Compute statistics for all embeddings in batch (GPU parallel processing)
         for emb in clean_embeddings_gpu:
             H, W, L, D = emb.shape
-            # Reshape to [N, L, D] where N = H*W spatial locations
             trajectories = emb.reshape(-1, L, D)
 
-            # ===== 1. Wavelet Statistics (Simple Haar-like wavelet) =====
-            # Detail coefficients (high-frequency components)
+            # ===== 1. Wavelet Statistics =====
             if L >= 2:
                 half_L = L // 2
-                detail = (trajectories[:, :half_L*2:2, :] - trajectories[:, 1:half_L*2:2, :]) / 2  # [N, L//2, D]
-                wavelet_coeff = torch.abs(detail)  # [N, L//2, D]
+                detail = (trajectories[:, :half_L*2:2, :] - trajectories[:, 1:half_L*2:2, :]) / 2
+                wavelet_coeff = torch.abs(detail)
                 all_wavelets.append(wavelet_coeff)
 
             # ===== 2. STFT Statistics =====
-            # Simple windowed RFFT (using half-window)
             window_size = max(2, L // 4)
             stft_powers = []
             for i in range(0, L - window_size + 1, window_size // 2):
-                window = trajectories[:, i:i+window_size, :]  # [N, window_size, D]
-                window_fft = torch.fft.rfft(window, dim=1)  # [N, window_size//2+1, D]
-                window_power = torch.abs(window_fft) ** 2  # [N, window_size//2+1, D]
-                # Log PSD
-                log_window_power = torch.log10(window_power + 1e-10)  # [N, window_size//2+1, D]
-                stft_powers.append(log_window_power.mean(dim=1))  # [N, D]
+                window = trajectories[:, i:i+window_size, :]
+                window_fft = torch.fft.rfft(window, dim=1)
+                window_power = torch.abs(window_fft) ** 2
+                log_window_power = torch.log10(window_power + 1e-10)
+                stft_powers.append(log_window_power.mean(dim=1))
+
             if stft_powers:
-                stft_power = torch.stack(stft_powers, dim=1)  # [N, num_windows, D]
+                stft_power = torch.stack(stft_powers, dim=1)
                 all_stfts.append(stft_power)
 
-            # ===== 3. HHT/EMD Statistics (Simplified EMD) =====
-            # Simplified Empirical Mode Decomposition: extract intrinsic mode functions
-            # We use iterative sifting to extract IMFs
-            N = trajectories.shape[0]
-            residual = trajectories.clone()  # [N, L, D]
+            # ===== 3. HHT/EMD Statistics =====
+            residual = trajectories
             imfs = []
 
-            for _ in range(min(3, L // 2)):  # Extract up to 3 IMFs
-                # Simple sifting: subtract local mean (moving average)
+            for _ in range(min(3, L // 2)):
                 if L >= 3:
-                    # Compute local mean using simple convolution
-                    padded = torch.nn.functional.pad(residual, (0, 0, 1, 1), mode='replicate')  # [N, L+2, D]
-                    local_mean = (padded[:, :-2, :] + padded[:, 1:-1, :] + padded[:, 2:, :]) / 3.0  # [N, L, D]
+                    padded = torch.nn.functional.pad(residual, (0, 0, 1, 1), mode='replicate')
+                    local_mean = (padded[:, :-2, :] + padded[:, 1:-1, :] + padded[:, 2:, :]) / 3.0
                     imf = residual - local_mean
-                    imfs.append(torch.abs(imf).mean(dim=1))  # [N, D]
+                    imfs.append(torch.abs(imf).mean(dim=1))
                     residual = local_mean
                 else:
                     break
 
             if imfs:
-                hht_features = torch.stack(imfs, dim=1)  # [N, num_imfs, D]
+                hht_features = torch.stack(imfs, dim=1)
                 all_hhts.append(hht_features)
 
-            # ===== 4. Synchrosqueezed STFT (SST) =====
-            # SST: Time-frequency reassignment for better localization
-            # Simplified version: compute instantaneous frequency and reassign
+            # ===== 4. Synchrosqueezed STFT =====
             window_size = max(2, L // 4)
             sst_features = []
 
             for i in range(0, L - window_size + 1, window_size // 2):
-                window = trajectories[:, i:i+window_size, :]  # [N, window_size, D]
+                window = trajectories[:, i:i+window_size, :]
+                window_fft = torch.fft.rfft(window, dim=1)
 
-                # Compute STFT
-                window_fft = torch.fft.rfft(window, dim=1)  # [N, window_size//2+1, D]
-
-                # Compute phase derivative (instantaneous frequency)
                 if i > 0 and i + window_size <= L:
                     prev_window = trajectories[:, i-1:i-1+window_size, :]
                     prev_fft = torch.fft.rfft(prev_window, dim=1)
 
-                    # Phase difference
                     phase_curr = torch.angle(window_fft)
                     phase_prev = torch.angle(prev_fft)
-                    inst_freq = torch.abs(phase_curr - phase_prev)  # [N, window_size//2+1, D]
+                    inst_freq = torch.abs(phase_curr - phase_prev)
 
-                    # Weighted by magnitude
                     magnitude = torch.abs(window_fft)
-                    sst_feature = (inst_freq * magnitude).sum(dim=1)  # [N, D]
+                    sst_feature = (inst_freq * magnitude).sum(dim=1)
                 else:
-                    # Fallback: just use magnitude
-                    sst_feature = torch.abs(window_fft).mean(dim=1)  # [N, D]
+                    sst_feature = torch.abs(window_fft).mean(dim=1)
 
                 sst_features.append(sst_feature)
 
             if sst_features:
-                sst_power = torch.stack(sst_features, dim=1)  # [N, num_windows, D]
+                sst_power = torch.stack(sst_features, dim=1)
                 all_ssts.append(sst_power)
 
-        # Concatenate all statistics across images
-        # Wavelet statistics
+        # Batch update statistics (one call per metric type)
         if all_wavelets:
-            all_wavelets = torch.cat(all_wavelets, dim=0)  # [N_total, L//2, D]
-            N = all_wavelets.shape[0]
-            all_wavelets_flat = all_wavelets.reshape(N, -1)  # [N_total, (L//2)*D]
-            self.mean_wavelet = all_wavelets_flat.mean(dim=0)  # [(L//2)*D]
+            all_wavelets = torch.cat(all_wavelets, dim=0)
+            all_wavelets_flat = all_wavelets.reshape(all_wavelets.shape[0], -1)
+            self._update_statistics('wavelet', all_wavelets_flat)
+            del all_wavelets, all_wavelets_flat
 
-            centered = all_wavelets_flat - self.mean_wavelet.unsqueeze(0)
-            cov = (centered.T @ centered) / (N - 1)
-            cov += torch.eye(cov.shape[0], device=self.device) * 1e-6
-            self.cov_inv_wavelet = torch.linalg.inv(cov)
-
-        # STFT statistics
         if all_stfts:
-            all_stfts = torch.cat(all_stfts, dim=0)  # [N_total, num_windows, D]
-            N = all_stfts.shape[0]
-            all_stfts_flat = all_stfts.reshape(N, -1)  # [N_total, num_windows*D]
-            self.mean_stft = all_stfts_flat.mean(dim=0)  # [num_windows*D]
+            all_stfts = torch.cat(all_stfts, dim=0)
+            all_stfts_flat = all_stfts.reshape(all_stfts.shape[0], -1)
+            self._update_statistics('stft', all_stfts_flat)
+            del all_stfts, all_stfts_flat
 
-            centered = all_stfts_flat - self.mean_stft.unsqueeze(0)
-            cov = (centered.T @ centered) / (N - 1)
-            cov += torch.eye(cov.shape[0], device=self.device) * 1e-6
-            self.cov_inv_stft = torch.linalg.inv(cov)
-
-        # HHT/EMD statistics
         if all_hhts:
-            all_hhts = torch.cat(all_hhts, dim=0)  # [N_total, num_imfs, D]
-            N = all_hhts.shape[0]
-            all_hhts_flat = all_hhts.reshape(N, -1)  # [N_total, num_imfs*D]
-            self.mean_hht = all_hhts_flat.mean(dim=0)  # [num_imfs*D]
+            all_hhts = torch.cat(all_hhts, dim=0)
+            all_hhts_flat = all_hhts.reshape(all_hhts.shape[0], -1)
+            self._update_statistics('hht', all_hhts_flat)
+            del all_hhts, all_hhts_flat
 
-            centered = all_hhts_flat - self.mean_hht.unsqueeze(0)
-            cov = (centered.T @ centered) / (N - 1)
-            cov += torch.eye(cov.shape[0], device=self.device) * 1e-6
-            self.cov_inv_hht = torch.linalg.inv(cov)
-
-        # Synchrosqueezed STFT statistics
         if all_ssts:
-            all_ssts = torch.cat(all_ssts, dim=0)  # [N_total, num_windows, D]
-            N = all_ssts.shape[0]
-            all_ssts_flat = all_ssts.reshape(N, -1)  # [N_total, num_windows*D]
-            self.mean_sst = all_ssts_flat.mean(dim=0)  # [num_windows*D]
+            all_ssts = torch.cat(all_ssts, dim=0)
+            all_ssts_flat = all_ssts.reshape(all_ssts.shape[0], -1)
+            self._update_statistics('sst', all_ssts_flat)
+            del all_ssts, all_ssts_flat
 
-            centered = all_ssts_flat - self.mean_sst.unsqueeze(0)
-            cov = (centered.T @ centered) / (N - 1)
-            cov += torch.eye(cov.shape[0], device=self.device) * 1e-6
-            self.cov_inv_sst = torch.linalg.inv(cov)
+        # Explicit memory cleanup
+        torch.cuda.empty_cache()
+
+        return self
+
+    def _update_statistics(self, stat_type, batch_data):
+        """
+        Update mean and M2 using batch-wise Welford's algorithm (GPU-optimized)
+
+        Args:
+            stat_type: 'wavelet', 'stft', 'hht', or 'sst'
+            batch_data: [N_batch, D] tensor
+        """
+        N_batch = batch_data.shape[0]
+
+        # Get corresponding mean and M2
+        if stat_type == 'wavelet':
+            mean_attr = 'mean_wavelet'
+            M2_attr = 'M2_wavelet'
+        elif stat_type == 'stft':
+            mean_attr = 'mean_stft'
+            M2_attr = 'M2_stft'
+        elif stat_type == 'hht':
+            mean_attr = 'mean_hht'
+            M2_attr = 'M2_hht'
+        elif stat_type == 'sst':
+            mean_attr = 'mean_sst'
+            M2_attr = 'M2_sst'
+
+        # Initialize if first batch
+        if getattr(self, mean_attr) is None:
+            setattr(self, mean_attr, torch.zeros(batch_data.shape[1], device=self.device))
+            setattr(self, M2_attr, torch.zeros(batch_data.shape[1], device=self.device))
+
+        old_mean = getattr(self, mean_attr)
+        old_M2 = getattr(self, M2_attr)
+        old_n = self.n_samples
+
+        # Batch-wise update (GPU-accelerated)
+        # Compute batch statistics
+        batch_mean = batch_data.mean(dim=0)  # [D]
+        batch_var = batch_data.var(dim=0, unbiased=False)  # [D]
+
+        # Update count
+        new_n = old_n + N_batch
+
+        # Combine means
+        delta = batch_mean - old_mean
+        new_mean = old_mean + delta * (N_batch / new_n)
+
+        # Combine M2 using parallel algorithm
+        new_M2 = old_M2 + batch_var * N_batch + delta ** 2 * (old_n * N_batch / new_n)
+
+        setattr(self, mean_attr, new_mean)
+        setattr(self, M2_attr, new_M2)
+        self.n_samples = new_n
+
+    def finalize(self):
+        """
+        Finalize statistics by computing covariance inverse from accumulated M2
+
+        Call this after all partial_fit calls are complete.
+
+        Returns:
+            self: For method chaining
+        """
+        print(f"  Finalizing statistics from {self.n_samples} samples...")
+
+        # Compute covariance matrices from M2
+        if self.M2_wavelet is not None and self.n_samples > 1:
+            # For single-dimensional covariance, M2/(n-1) gives variance
+            # For multi-dimensional, we need full covariance matrix
+            # Here we use diagonal approximation for efficiency
+            var_wavelet = self.M2_wavelet / (self.n_samples - 1)
+            cov_wavelet = torch.diag(var_wavelet)
+            cov_wavelet += torch.eye(cov_wavelet.shape[0], device=self.device) * 1e-6
+            self.cov_inv_wavelet = torch.linalg.inv(cov_wavelet)
+
+        if self.M2_stft is not None and self.n_samples > 1:
+            var_stft = self.M2_stft / (self.n_samples - 1)
+            cov_stft = torch.diag(var_stft)
+            cov_stft += torch.eye(cov_stft.shape[0], device=self.device) * 1e-6
+            self.cov_inv_stft = torch.linalg.inv(cov_stft)
+
+        if self.M2_hht is not None and self.n_samples > 1:
+            var_hht = self.M2_hht / (self.n_samples - 1)
+            cov_hht = torch.diag(var_hht)
+            cov_hht += torch.eye(cov_hht.shape[0], device=self.device) * 1e-6
+            self.cov_inv_hht = torch.linalg.inv(cov_hht)
+
+        if self.M2_sst is not None and self.n_samples > 1:
+            var_sst = self.M2_sst / (self.n_samples - 1)
+            cov_sst = torch.diag(var_sst)
+            cov_sst += torch.eye(cov_sst.shape[0], device=self.device) * 1e-6
+            self.cov_inv_sst = torch.linalg.inv(cov_sst)
 
         self.fitted = True
 
@@ -243,3 +308,92 @@ class AttractorLearner:
             print(f"      Cov inv:    {self.cov_inv_sst.shape}")
 
         return self
+
+    def save(self, cache_path):
+        """
+        Save attractor statistics to disk
+
+        Args:
+            cache_path: Path to save the attractor cache file
+        """
+        cache_path = Path(cache_path)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+        state = {
+            'fitted': self.fitted,
+            'n_samples': self.n_samples,
+            'mean_wavelet': self.mean_wavelet,
+            'cov_inv_wavelet': self.cov_inv_wavelet,
+            'mean_stft': self.mean_stft,
+            'cov_inv_stft': self.cov_inv_stft,
+            'mean_hht': self.mean_hht,
+            'cov_inv_hht': self.cov_inv_hht,
+            'mean_sst': self.mean_sst,
+            'cov_inv_sst': self.cov_inv_sst,
+            'M2_wavelet': self.M2_wavelet,
+            'M2_stft': self.M2_stft,
+            'M2_hht': self.M2_hht,
+            'M2_sst': self.M2_sst,
+        }
+
+        torch.save(state, cache_path)
+        print(f"  ✓ Attractor saved to: {cache_path}")
+
+    def load(self, cache_path):
+        """
+        Load attractor statistics from disk
+
+        Args:
+            cache_path: Path to the attractor cache file
+
+        Returns:
+            self: For method chaining
+
+        Raises:
+            FileNotFoundError: If cache file doesn't exist
+        """
+        cache_path = Path(cache_path)
+        if not cache_path.exists():
+            raise FileNotFoundError(f"Attractor cache not found: {cache_path}")
+
+        state = torch.load(cache_path, map_location=self.device)
+
+        self.fitted = state['fitted']
+        self.n_samples = state['n_samples']
+        self.mean_wavelet = state['mean_wavelet']
+        self.cov_inv_wavelet = state['cov_inv_wavelet']
+        self.mean_stft = state['mean_stft']
+        self.cov_inv_stft = state['cov_inv_stft']
+        self.mean_hht = state['mean_hht']
+        self.cov_inv_hht = state['cov_inv_hht']
+        self.mean_sst = state['mean_sst']
+        self.cov_inv_sst = state['cov_inv_sst']
+        self.M2_wavelet = state['M2_wavelet']
+        self.M2_stft = state['M2_stft']
+        self.M2_hht = state['M2_hht']
+        self.M2_sst = state['M2_sst']
+
+        print(f"  ✓ Attractor loaded from: {cache_path}")
+        print(f"  ✓ Trained on {self.n_samples} samples")
+
+        return self
+
+    @staticmethod
+    def get_cache_filename(imagenet_path, num_samples, spatial_resolution, feature_dim):
+        """
+        Generate a unique cache filename based on configuration
+
+        Args:
+            imagenet_path: Path to ImageNet dataset
+            num_samples: Number of samples used for training
+            spatial_resolution: Spatial resolution of features
+            feature_dim: Feature dimension
+
+        Returns:
+            str: Cache filename
+        """
+        # Create a hash of the configuration
+        config_str = f"{imagenet_path}_{num_samples}_{spatial_resolution}_{feature_dim}"
+        config_hash = hashlib.md5(config_str.encode()).hexdigest()[:8]
+
+        return f"attractor_s{num_samples}_r{spatial_resolution}_d{feature_dim}_{config_hash}.pt"

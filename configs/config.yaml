@@ -20,6 +20,12 @@ data:
     num_samples: 1000  # Number of samples to use for learning (-1 for all)
     batch_size: 128  # Batch size for processing
 
+  # Attractor cache configuration
+  attractor:
+    cache_dir: attractor_cache  # Directory to save/load attractor statistics
+    use_cache: true  # Whether to use cached attractor if available
+    force_recompute: false  # Force recompute even if cache exists
+
   # Phase 2: Domain-specific clean images for threshold adaptation
   domain:
     clean_path: images_without_patches  # Path to clean images of target domain

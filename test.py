@@ -21,6 +21,7 @@ import time
 import hydra
 from omegaconf import DictConfig, OmegaConf
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 from attracter import AttractorLearner
 from dataloader import LocalImageDataset
@@ -109,72 +110,105 @@ def main(cfg: DictConfig):
 
     phase2_start = time.time()
 
-    try:
-        from torchvision.datasets import ImageFolder
-
-        # Load ImageNet dataset
-        imagenet_dataset = ImageFolder(root=cfg.data.imagenet.path, transform=transform)
-        print(f"\n✓ Found {len(imagenet_dataset)} images in {len(imagenet_dataset.classes)} classes")
-
-        # Sample subset
-        num_samples = cfg.data.imagenet.num_samples if cfg.data.imagenet.num_samples > 0 else len(imagenet_dataset)
-        num_samples = min(num_samples, len(imagenet_dataset))
-
-        indices = torch.randperm(len(imagenet_dataset))[:num_samples].tolist()
-        imagenet_subset = Subset(imagenet_dataset, indices)
-
-        imagenet_loader = DataLoader(
-            imagenet_subset,
-            batch_size=cfg.data.imagenet.batch_size,
-            shuffle=False,
-            num_workers=cfg.device.num_workers,
-            pin_memory=True
-        )
-
-        print(f"✓ Using {num_samples} samples for base learning")
-
-        # Extract embeddings from ImageNet (keep on GPU)
-        print("\nExtracting trajectory embeddings...")
-        clean_embeddings_gpu = []
-        total_processed = 0
-
-        for batch_idx, (imgs, _) in enumerate(imagenet_loader):
-            imgs_gpu = imgs.to(device, non_blocking=True)
-
-            # Extract activations
-            activations = extractor(imgs_gpu)  # List of [B, C, H, W]
-
-            # Stack all layers into trajectories
-            embeddings_batch = stack_trajectory(activations)  # [B, H, W, L, C]
-
-            # Keep as list of individual embeddings
-            for b in range(embeddings_batch.shape[0]):
-                clean_embeddings_gpu.append(embeddings_batch[b])  # [H, W, L, C]
-
-            total_processed += imgs.shape[0]
-
-            if (batch_idx + 1) % 5 == 0 or (batch_idx + 1) == len(imagenet_loader):
-                print(f"  Processed: {total_processed}/{num_samples} images "
-                      f"({100*total_processed/num_samples:.1f}%)")
-
-        phase2_time = time.time() - phase2_start
-        print(f"\n✓ Embedding extraction completed in {phase2_time:.2f}s")
-        print(f"  Extracted {len(clean_embeddings_gpu)} trajectory embeddings")
-
-    except FileNotFoundError as e:
-        print(f"\n✗ Error: ImageNet path not found: {cfg.data.imagenet.path}")
-        print(f"  Please update the path in configs/config.yaml")
-        extractor.remove_hooks()
-        return
-    except Exception as e:
-        print(f"\n✗ Error loading ImageNet: {e}")
-        extractor.remove_hooks()
-        return
-
-    # Learn attractor from ImageNet trajectories
-    print("\nLearning normal trajectory characteristics...")
+    # Check for cached attractor
     attractor_learner = AttractorLearner(device=device)
-    attractor_learner.fit(clean_embeddings_gpu)
+    use_cache = cfg.data.attractor.use_cache
+    force_recompute = cfg.data.attractor.force_recompute
+    cache_dir = Path(cfg.data.attractor.cache_dir)
+
+    # Generate cache filename based on configuration
+    cache_filename = AttractorLearner.get_cache_filename(
+        cfg.data.imagenet.path,
+        cfg.data.imagenet.num_samples,
+        cfg.model.spatial_resolution,
+        cfg.model.feature_dim
+    )
+    cache_path = cache_dir / cache_filename
+
+    # Try to load cached attractor
+    attractor_loaded = False
+    if use_cache and not force_recompute and cache_path.exists():
+        try:
+            print(f"\n✓ Found cached attractor: {cache_path}")
+            print(f"  Loading cached attractor...")
+            attractor_learner.load(cache_path)
+            attractor_loaded = True
+            phase2_time = time.time() - phase2_start
+            print(f"\n✓ Attractor loaded in {phase2_time:.2f}s")
+        except Exception as e:
+            print(f"\n⚠ Warning: Failed to load cache: {e}")
+            print(f"  Will recompute attractor...")
+            attractor_loaded = False
+
+    if not attractor_loaded:
+        print(f"\n  Computing attractor from scratch...")
+
+        try:
+            from torchvision.datasets import ImageFolder
+
+            # Load ImageNet dataset
+            imagenet_dataset = ImageFolder(root=cfg.data.imagenet.path, transform=transform)
+            print(f"\n✓ Found {len(imagenet_dataset)} images in {len(imagenet_dataset.classes)} classes")
+
+            # Sample subset
+            num_samples = cfg.data.imagenet.num_samples if cfg.data.imagenet.num_samples > 0 else len(imagenet_dataset)
+            num_samples = min(num_samples, len(imagenet_dataset))
+
+            indices = torch.randperm(len(imagenet_dataset))[:num_samples].tolist()
+            imagenet_subset = Subset(imagenet_dataset, indices)
+
+            imagenet_loader = DataLoader(
+                imagenet_subset,
+                batch_size=cfg.data.imagenet.batch_size,
+                shuffle=False,
+                num_workers=cfg.device.num_workers,
+                pin_memory=True
+            )
+
+            print(f"✓ Using {num_samples} samples for base learning")
+
+            # Extract embeddings and incrementally update attractor
+            print("\nExtracting trajectory embeddings and updating attractor...")
+
+            for imgs, _ in tqdm(imagenet_loader, desc="  Learning attractor", total=len(imagenet_loader)):
+                imgs_gpu = imgs.to(device, non_blocking=True)
+
+                # Extract activations
+                activations = extractor(imgs_gpu)  # List of [B, C, H, W]
+
+                # Stack all layers into trajectories
+                embeddings_batch = stack_trajectory(activations)  # [B, H, W, L, C]
+
+                # Convert batch to list of individual embeddings
+                batch_embeddings = [embeddings_batch[b] for b in range(embeddings_batch.shape[0])]
+
+                # Incrementally update attractor with this batch
+                attractor_learner.partial_fit(batch_embeddings)
+
+            total_processed = num_samples
+
+            phase2_time = time.time() - phase2_start
+            print(f"\n✓ Embedding extraction completed in {phase2_time:.2f}s")
+            print(f"  Processed {total_processed} images incrementally")
+
+        except FileNotFoundError as e:
+            print(f"\n✗ Error: ImageNet path not found: {cfg.data.imagenet.path}")
+            print(f"  Please update the path in configs/config.yaml")
+            extractor.remove_hooks()
+            return
+        except Exception as e:
+            print(f"\n✗ Error loading ImageNet: {e}")
+            extractor.remove_hooks()
+            return
+
+        # Finalize attractor statistics
+        print("\nFinalizing normal trajectory characteristics...")
+        attractor_learner.finalize()
+
+        # Save attractor to cache
+        if use_cache:
+            print(f"\nSaving attractor to cache...")
+            attractor_learner.save(cache_path)
 
     # Create detector (will be updated after Phase 3)
     detector = None
