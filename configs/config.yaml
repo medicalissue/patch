@@ -62,9 +62,6 @@ detection:
   # Parameters for 'percentile' method (per score)
   percentile: 95.0  # Use this percentile as threshold
 
-  # Weights for 'weighted_voting' method (4 scores: wavelet, stft, hht, sst)
-  score_weights: [1.0, 1.0, 1.0, 1.0]
-
   detection_pixel_threshold: 0  # Minimum number of anomalous pixels to classify as detected
 
 # Output configuration

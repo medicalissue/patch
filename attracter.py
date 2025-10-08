@@ -378,6 +378,115 @@ class AttractorLearner:
 
         return self
 
+    def adapt_to_domain(self, domain_embeddings_gpu):
+        """
+        Adapt ImageNet statistics to domain-specific distribution using statistical alignment
+
+        This computes domain statistics and prepares adaptation parameters without neural networks.
+        Uses CORAL-style covariance alignment for domain shift correction.
+
+        Args:
+            domain_embeddings_gpu: List of [H, W, L, D] tensors from domain clean images
+
+        Returns:
+            dict: Domain statistics for each metric type
+        """
+        print(f"\n  [Domain Adaptation]")
+        print(f"  Computing domain statistics from {len(domain_embeddings_gpu)} clean images...")
+
+        domain_stats = {}
+
+        # Collect domain statistics (same feature extraction as ImageNet)
+        all_wavelets = []
+        all_stfts = []
+        all_hhts = []
+        all_ssts = []
+
+        for emb in domain_embeddings_gpu:
+            H, W, L, D = emb.shape
+            trajectories = emb.reshape(-1, L, D)
+
+            # Extract same features as ImageNet
+            if L >= 2:
+                half_L = L // 2
+                detail = (trajectories[:, :half_L*2:2, :] - trajectories[:, 1:half_L*2:2, :]) / 2
+                wavelet_coeff = torch.abs(detail)
+                all_wavelets.append(wavelet_coeff)
+
+            window_size = max(2, L // 4)
+            stft_powers = []
+            for i in range(0, L - window_size + 1, window_size // 2):
+                window = trajectories[:, i:i+window_size, :]
+                window_fft = torch.fft.rfft(window, dim=1)
+                window_power = torch.abs(window_fft) ** 2
+                log_window_power = torch.log10(window_power + 1e-10)
+                stft_powers.append(log_window_power.mean(dim=1))
+            if stft_powers:
+                stft_power = torch.stack(stft_powers, dim=1)
+                all_stfts.append(stft_power)
+
+            residual = trajectories
+            imfs = []
+            for _ in range(min(3, L // 2)):
+                if L >= 3:
+                    padded = torch.nn.functional.pad(residual, (0, 0, 1, 1), mode='replicate')
+                    local_mean = (padded[:, :-2, :] + padded[:, 1:-1, :] + padded[:, 2:, :]) / 3.0
+                    imf = residual - local_mean
+                    imfs.append(torch.abs(imf).mean(dim=1))
+                    residual = local_mean
+                else:
+                    break
+            if imfs:
+                hht_features = torch.stack(imfs, dim=1)
+                all_hhts.append(hht_features)
+
+            window_size = max(2, L // 4)
+            sst_features = []
+            for i in range(0, L - window_size + 1, window_size // 2):
+                window = trajectories[:, i:i+window_size, :]
+                window_fft = torch.fft.rfft(window, dim=1)
+                if i > 0 and i + window_size <= L:
+                    prev_window = trajectories[:, i-1:i-1+window_size, :]
+                    prev_fft = torch.fft.rfft(prev_window, dim=1)
+                    phase_curr = torch.angle(window_fft)
+                    phase_prev = torch.angle(prev_fft)
+                    inst_freq = torch.abs(phase_curr - phase_prev)
+                    magnitude = torch.abs(window_fft)
+                    sst_feature = (inst_freq * magnitude).sum(dim=1)
+                else:
+                    sst_feature = torch.abs(window_fft).mean(dim=1)
+                sst_features.append(sst_feature)
+            if sst_features:
+                sst_power = torch.stack(sst_features, dim=1)
+                all_ssts.append(sst_power)
+
+        # Compute domain statistics
+        def compute_stats(data_list, name):
+            if not data_list:
+                return None
+            data = torch.cat(data_list, dim=0)
+            data_flat = data.reshape(data.shape[0], -1)
+
+            mean_domain = data_flat.mean(dim=0)
+            centered = data_flat - mean_domain
+            cov_domain = (centered.T @ centered) / (data_flat.shape[0] - 1)
+            cov_domain += torch.eye(cov_domain.shape[0], device=self.device) * 1e-6
+
+            print(f"    {name}: domain mean shape {mean_domain.shape}")
+            return {
+                'mean': mean_domain,
+                'cov': cov_domain
+            }
+
+        domain_stats['wavelet'] = compute_stats(all_wavelets, 'Wavelet')
+        domain_stats['stft'] = compute_stats(all_stfts, 'STFT')
+        domain_stats['hht'] = compute_stats(all_hhts, 'HHT/EMD')
+        domain_stats['sst'] = compute_stats(all_ssts, 'SST')
+
+        print(f"  ✓ Domain adaptation complete")
+
+        return domain_stats
+
     @staticmethod
     def get_cache_filename(imagenet_path, num_samples, spatial_resolution, feature_dim):
         """

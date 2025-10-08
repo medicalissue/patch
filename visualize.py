@@ -90,9 +90,11 @@ def visualize_results(image, anomaly_map_gpu, patch_mask_gpu,
     ax2 = fig.add_subplot(gs[0, 1])
     im1 = ax2.imshow(anomaly_map, cmap='hot', interpolation='bilinear')
 
-    title_text = f'Vote Count Map'
+    title_text = 'Vote Map' if fusion_method in ('voting', 'weighted_voting', 'all', 'any') else 'Fusion Map'
     if fusion_method == 'voting':
         title_text += f' ({voting_threshold}/4 votes needed)'
+    elif fusion_method == 'weighted_voting':
+        title_text += f' (threshold ≥ {voting_threshold})'
     title_text += f'\nMax: {anomaly_map.max():.1f}, Mean: {anomaly_map.mean():.1f}'
     ax2.set_title(title_text, fontsize=10, fontweight='bold')
     ax2.axis('off')
