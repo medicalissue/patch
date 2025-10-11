@@ -39,6 +39,15 @@ model:
   spatial_resolution: 7  # Spatial resolution for feature extraction (7, 14, 28, 56)
   feature_dim: 128  # Feature dimension after channel pooling
 
+  # Trajectory processing options
+  trajectory:
+    normalize_steps: true  # Apply per-layer z-score normalization
+    normalization_eps: 1.0e-6  # Epsilon for normalization stability
+    depth_scaling:
+      enabled: false  # Scale features by layer depth (positional scalar)
+      start: 0.8  # Scale factor for earliest layer
+      end: 1.2  # Scale factor for deepest layer
+
   # Model architecture selection: 'autoencoder', 'vae', 'transformer'
   type: autoencoder  # Choose time-series anomaly detection model
 
@@ -52,6 +61,8 @@ model:
   # Training settings
   learning_rate: 0.001  # Learning rate for Phase 1 training
   weight_decay: 0.0001  # Weight decay (L2 regularization)
+  vae_beta_max: 0.001  # Target beta weight for VAE KL term
+  vae_beta_warmup_steps: 2000  # Warmup steps for beta annealing
 
   # Weight management for Phase 1 (Base Model)
   phase1:
@@ -102,3 +113,9 @@ detection:
 output:
   dir: detection_results  # Directory to save detection results
   save_visualizations: true  # Whether to save visualization images
+
+# Experiment Tracking
+experiment:
+  use_wandb: false  # Enable Weights & Biases logging
+  wandb_project: patch-detection  # W&B project name
+  wandb_entity: null  # W&B entity (username/team), null = default

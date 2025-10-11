@@ -83,10 +83,28 @@ def main(cfg: DictConfig):
     print(f"  Spatial resolution: {cfg.model.spatial_resolution}x{cfg.model.spatial_resolution}")
     print(f"  Feature dimension: {cfg.model.feature_dim}")
 
+    trajectory_cfg = getattr(cfg.model, 'trajectory', None)
+    normalize_steps = True
+    normalization_eps = 1e-6
+    depth_scaling = None
+
+    if trajectory_cfg is not None:
+        normalize_steps = getattr(trajectory_cfg, 'normalize_steps', True)
+        normalization_eps = getattr(trajectory_cfg, 'normalization_eps', 1e-6)
+        depth_scaling_cfg = getattr(trajectory_cfg, 'depth_scaling', None)
+        if depth_scaling_cfg is not None and getattr(depth_scaling_cfg, 'enabled', False):
+            depth_scaling = (
+                getattr(depth_scaling_cfg, 'start', 1.0),
+                getattr(depth_scaling_cfg, 'end', 1.0),
+            )
+
     extractor = ActivationExtractor(
         model,
         feature_dim=cfg.model.feature_dim,
-        spatial_size=cfg.model.spatial_resolution
+        spatial_size=cfg.model.spatial_resolution,
+        normalize_steps=normalize_steps,
+        normalization_eps=normalization_eps,
+        depth_scaling=depth_scaling,
     )
     print("✓ Extractor initialized")
 
@@ -116,7 +134,7 @@ def main(cfg: DictConfig):
         model_type=cfg.model.type,
         input_dim=cfg.model.feature_dim,
         device=device,
-        model_cfg=cfg.model
+        cfg=cfg,
     )
 
     # Check for saved weights
@@ -179,30 +197,22 @@ def main(cfg: DictConfig):
 
             print(f"✓ Using {num_samples} samples for training")
 
-            # Extract embeddings
-            print("\nExtracting trajectory embeddings from ImageNet...")
-            train_embeddings = []
-
-            for imgs, _ in tqdm(imagenet_loader, desc="  Extracting embeddings", total=len(imagenet_loader)):
-                imgs_gpu = imgs.to(device, non_blocking=True)
-
-                # Extract activations
-                activations = extractor(imgs_gpu)  # List of [B, C, H, W]
-
-                # Stack all layers into trajectories
-                embeddings_batch = stack_trajectory(activations)  # [B, H, W, L, C]
-
-                # Convert batch to list of individual embeddings
-                for b in range(embeddings_batch.shape[0]):
-                    train_embeddings.append(embeddings_batch[b])
-
-            print(f"\n✓ Extracted {len(train_embeddings)} embeddings")
-
-            # Train model
-            model_trainer.train(
-                train_embeddings,
+            # Train model in streaming mode (no memory accumulation!)
+            print("\nTraining model in streaming mode (memory-efficient)...")
+            use_wandb = cfg.experiment.use_wandb if hasattr(cfg, 'experiment') else False
+            wandb_config = None
+            if use_wandb and hasattr(cfg, 'experiment'):
+                wandb_config = {
+                    'project': cfg.experiment.wandb_project,
+                    'entity': cfg.experiment.wandb_entity,
+                    'name': f'train-{cfg.model.type}'
+                }
+            model_trainer.train_streaming(
+                imagenet_loader,
+                extractor,
                 num_epochs=cfg.data.imagenet.num_epochs,
-                batch_size=cfg.data.imagenet.batch_size
+                use_wandb=use_wandb,
+                wandb_config=wandb_config
             )
 
             phase1_time = time.time() - phase1_start
@@ -261,16 +271,6 @@ def main(cfg: DictConfig):
 
                 print(f"\n✓ Processing {len(clean_domain_dataset)} clean domain images...")
 
-                # Extract domain embeddings
-                domain_embeddings = []
-                for batch_idx, (imgs, img_names) in enumerate(tqdm(clean_domain_loader, desc="  Extracting domain embeddings")):
-                    imgs_gpu = imgs.to(device, non_blocking=True)
-                    activations = extractor(imgs_gpu)
-                    embeddings_batch = stack_trajectory(activations)  # [B, H, W, L, C]
-
-                    for b in range(embeddings_batch.shape[0]):
-                        domain_embeddings.append(embeddings_batch[b])
-
                 # Check for saved LoRA weights
                 use_saved_lora = cfg.domain_adaptation.phase2.load_weights
                 save_lora = cfg.domain_adaptation.phase2.save_weights
@@ -302,12 +302,23 @@ def main(cfg: DictConfig):
                         lora_loaded = False
 
                 if not lora_loaded:
-                    # Apply LoRA and train
-                    model_trainer.adapt_with_lora(
-                        domain_embeddings,
+                    # Apply LoRA and train in streaming mode (no memory accumulation!)
+                    print("\nTraining LoRA in streaming mode (memory-efficient)...")
+                    use_wandb = cfg.experiment.use_wandb if hasattr(cfg, 'experiment') else False
+                    wandb_config = None
+                    if use_wandb and hasattr(cfg, 'experiment'):
+                        wandb_config = {
+                            'project': cfg.experiment.wandb_project,
+                            'entity': cfg.experiment.wandb_entity,
+                            'name': f'lora-{cfg.model.type}'
+                        }
+                    model_trainer.adapt_with_lora_streaming(
+                        clean_domain_loader,
+                        extractor,
                         lora_cfg=cfg.domain_adaptation.lora,
                         num_epochs=cfg.data.domain.num_epochs,
-                        batch_size=cfg.data.domain.batch_size
+                        use_wandb=use_wandb,
+                        wandb_config=wandb_config
                     )
 
                     phase2_time = time.time() - phase2_start
