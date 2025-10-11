@@ -5,9 +5,12 @@ This module provides visualization functions for displaying detection results.
 Supports model-based reconstruction error approach with simple, clean visualization.
 """
 
+import numpy as np
 import torch
-import matplotlib.pyplot as plt
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from sklearn.manifold import TSNE
 
 
 def denormalize_image(img_tensor):
@@ -26,11 +29,65 @@ def denormalize_image(img_tensor):
     img = torch.clamp(img, 0, 1)
     return img.permute(1, 2, 0).cpu().numpy()
 
+def _connected_components(mask):
+    """
+    Find 4-connected components in a binary mask.
+
+    Args:
+        mask: [H, W] boolean numpy array
+
+    Returns:
+        labels: [H, W] int32 array with 0 for background and positive integers per component
+        num_labels: number of detected components
+    """
+    h, w = mask.shape
+    labels = np.zeros((h, w), dtype=np.int32)
+    label = 0
+    stack = []
+
+    for i in range(h):
+        for j in range(w):
+            if not mask[i, j] or labels[i, j] != 0:
+                continue
+            label += 1
+            stack.append((i, j))
+            while stack:
+                x, y = stack.pop()
+                if labels[x, y] != 0:
+                    continue
+                labels[x, y] = label
+                for nx, ny in ((x-1, y), (x+1, y), (x, y-1), (x, y+1)):
+                    if 0 <= nx < h and 0 <= ny < w and mask[nx, ny] and labels[nx, ny] == 0:
+                        stack.append((nx, ny))
+
+    return labels, label
+
+
+def _build_component_colors(num_labels):
+    """
+    Create a color mapping for components.
+
+    Args:
+        num_labels: number of connected components
+
+    Returns:
+        dict mapping label -> RGBA tuple
+    """
+    if num_labels <= 0:
+        return {}
+
+    cmap = plt.cm.get_cmap('tab20', num_labels)
+    colors = {}
+    for idx in range(num_labels):
+        rgb = cmap(idx)[:3]
+        colors[idx + 1] = (*rgb, 0.5)
+    return colors
+
 
 def visualize_results(image, anomaly_map_gpu, patch_mask_gpu,
                      image_name="", threshold=0.0, detection_pixel_threshold=0,
                      threshold_method="percentile", threshold_formula="",
-                     model_type="autoencoder"):
+                     model_type="autoencoder", trajectories=None):
     """
     Visualize model-based detection results with reconstruction error
 
@@ -54,7 +111,8 @@ def visualize_results(image, anomaly_map_gpu, patch_mask_gpu,
         detection_pixel_threshold: int - minimum pixels for positive detection
         threshold_method: str - threshold calculation method ('mean_std', 'median_mad', 'percentile')
         threshold_formula: str - formula description for threshold calculation
-        model_type: str - model type ('autoencoder', 'vae', 'transformer')
+        model_type: str - model type ('autoencoder', 'vae', 'tcn_autoencoder', 'tcn_vae', 'transformer')
+        trajectories: Optional torch.Tensor [H, W, L, D] - trajectories used for t-SNE visualization
 
     Returns:
         matplotlib figure object
@@ -64,10 +122,13 @@ def visualize_results(image, anomaly_map_gpu, patch_mask_gpu,
     anomaly_map = anomaly_map_gpu.cpu().numpy()
     patch_mask = patch_mask_gpu.cpu().numpy()
 
-    fig = plt.figure(figsize=(16, 10))
-    gs = fig.add_gridspec(2, 3, hspace=0.3, wspace=0.3)
+    fig = plt.figure(figsize=(18, 12))
+    gs = fig.add_gridspec(3, 3, hspace=0.35, wspace=0.35, height_ratios=[1.0, 1.0, 0.8])
 
     img_display = denormalize_image(image)
+
+    component_labels, num_components = _connected_components(patch_mask.astype(bool))
+    component_colors = _build_component_colors(num_components)
 
     # Row 1: Original, Anomaly Map, Detection Overlay
     ax1 = fig.add_subplot(gs[0, 0])
@@ -88,15 +149,26 @@ def visualize_results(image, anomaly_map_gpu, patch_mask_gpu,
     ax3.imshow(img_display)
 
     if patch_mask.sum() > 0:
-        mask_upsampled = F.interpolate(
-            torch.tensor(patch_mask).float().unsqueeze(0).unsqueeze(0),
-            size=image.shape[1:], mode='nearest'
-        )[0, 0].numpy()
+        labels_tensor = torch.from_numpy(component_labels).float().unsqueeze(0).unsqueeze(0)
+        upsampled_labels = F.interpolate(
+            labels_tensor,
+            size=image.shape[1:],
+            mode='nearest'
+        )[0, 0].numpy().round().astype(np.int32)
 
-        overlay = torch.zeros((*mask_upsampled.shape, 4))
-        overlay[mask_upsampled > 0.5] = torch.tensor([1, 0, 0, 0.5])  # Red overlay
-        ax3.imshow(overlay.numpy())
-        ax3.contour(mask_upsampled, colors='red', linewidths=2, levels=[0.5])
+        overlay = np.zeros((*upsampled_labels.shape, 4), dtype=np.float32)
+        contour_levels = []
+        for label_idx, color in component_colors.items():
+            mask = upsampled_labels == label_idx
+            if not np.any(mask):
+                continue
+            overlay[mask] = np.array(color, dtype=np.float32)
+            contour_levels.append(label_idx)
+
+        ax3.imshow(overlay)
+        for label_idx in contour_levels:
+            ax3.contour(upsampled_labels == label_idx, colors=[component_colors[label_idx][:3]],
+                        linewidths=2, levels=[0.5])
 
     detected_pixels = patch_mask.sum()
     detection_rate = detected_pixels / patch_mask.size * 100
@@ -123,9 +195,89 @@ def visualize_results(image, anomaly_map_gpu, patch_mask_gpu,
     cbar2 = plt.colorbar(im2, ax=ax5, fraction=0.046, pad=0.04)
     cbar2.ax.tick_params(labelsize=10)
 
-    # Row 2: Metrics panel
-    ax6 = fig.add_subplot(gs[1, 2])
-    ax6.axis('off')
+    # Row 2: t-SNE visualization
+    ax7 = fig.add_subplot(gs[1, 2])
+    ax7.set_title('t-SNE of Trajectories', fontsize=11, fontweight='bold')
+    ax7.axis('off')
+
+    legend_handles = []
+    if trajectories is not None:
+        if torch.is_tensor(trajectories):
+            traj_cpu = trajectories.detach().cpu().numpy()
+        else:
+            traj_cpu = np.asarray(trajectories)
+        H, W, L, D = traj_cpu.shape
+        flattened = traj_cpu.reshape(H * W, L * D).astype(np.float32)
+
+        # Ensure perplexity is valid
+        n_samples = flattened.shape[0]
+        if n_samples > 2:
+            perplexity = max(5, min(30, n_samples // 3))
+            perplexity = min(perplexity, n_samples - 1)
+            if perplexity < 2:
+                perplexity = n_samples - 1 if n_samples - 1 >= 1 else 1
+
+            tsne = TSNE(
+                n_components=2,
+                init='pca',
+                learning_rate='auto',
+                perplexity=perplexity
+            )
+            embedding = tsne.fit_transform(flattened)
+
+            labels_flat = component_labels.reshape(-1)
+            colors = []
+            sizes = []
+            for lbl in labels_flat:
+                if lbl == 0:
+                    colors.append((0.7, 0.7, 0.7, 0.6))
+                    sizes.append(20)
+                else:
+                    rgba = component_colors.get(lbl, (1.0, 0.0, 0.0, 0.8))
+                    colors.append((*rgba[:3], 0.9))
+                    sizes.append(55)
+
+            ax7.scatter(
+                embedding[:, 0],
+                embedding[:, 1],
+                c=colors,
+                s=sizes,
+                edgecolors='k',
+                linewidths=0.3,
+                alpha=0.85
+            )
+            ax7.set_axis_on()
+            ax7.set_xticks([])
+            ax7.set_yticks([])
+
+            # Build legend entries for detected components
+            if component_colors:
+                legend_handles.append(Line2D([0], [0], marker='o', color='w',
+                                             markerfacecolor=(0.7, 0.7, 0.7),
+                                             markeredgecolor='k',
+                                             markersize=8, label='Background'))
+                for label_idx, color in component_colors.items():
+                    legend_handles.append(Line2D(
+                        [0], [0], marker='o', color='w',
+                        markerfacecolor=color[:3],
+                        markeredgecolor='k',
+                        markersize=8,
+                        label=f'Detection {label_idx}'
+                    ))
+            else:
+                legend_handles.append(Line2D([0], [0], marker='o', color='w',
+                                             markerfacecolor=(0.7, 0.7, 0.7),
+                                             markeredgecolor='k',
+                                             markersize=8, label='Background'))
+
+            ax7.legend(handles=legend_handles, fontsize=9, loc='best', framealpha=0.8)
+        else:
+            ax7.text(0.5, 0.5, "t-SNE requires at least 3 trajectories",
+                     ha='center', va='center', fontsize=10)
+
+    # Row 3: Metrics panel spanning entire row
+    ax_metrics = fig.add_subplot(gs[2, :])
+    ax_metrics.axis('off')
 
     spatial_res = f"{anomaly_map.shape[0]}×{anomaly_map.shape[1]}"
 
@@ -142,6 +294,8 @@ def visualize_results(image, anomaly_map_gpu, patch_mask_gpu,
     model_display = {
         'autoencoder': 'Autoencoder (LSTM)',
         'vae': 'VAE (Variational)',
+        'tcn_autoencoder': 'TCN Autoencoder',
+        'tcn_vae': 'TCN VAE',
         'transformer': 'Transformer (Attention)'
     }.get(model_type.lower(), model_type)
 
@@ -180,15 +334,15 @@ Detection Results:
 ━━━━━━━━━━━━━━━━━━━━━━━━━
     """
 
-    ax6.text(0.5, 0.5, metrics_text,
-            fontsize=10,
-            verticalalignment='center',
-            horizontalalignment='center',
-            fontfamily='monospace',
-            bbox=dict(boxstyle='round,pad=1.2',
-                     facecolor=bg_color,
-                     alpha=0.9,
-                     edgecolor=status_color,
-                     linewidth=3))
+    ax_metrics.text(0.5, 0.5, metrics_text,
+                    fontsize=10,
+                    verticalalignment='center',
+                    horizontalalignment='center',
+                    fontfamily='monospace',
+                    bbox=dict(boxstyle='round,pad=1.2',
+                              facecolor=bg_color,
+                              alpha=0.9,
+                              edgecolor=status_color,
+                              linewidth=3))
 
     return fig

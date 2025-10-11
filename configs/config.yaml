@@ -10,34 +10,34 @@
 # Device configuration
 device:
   cuda_id: 2  # CUDA device ID (0, 1, 2, etc.)
-  num_workers: 8  # DataLoader workers (adjust based on CPU cores)
+  num_workers: 24  # DataLoader workers (adjust based on CPU cores)
 
 # Data configuration
 data:
   # Phase 1: ImageNet data for model training (clean images only)
   imagenet:
     path: /data/ImageNet/train  # Path to ImageNet training data
-    num_samples: 1000  # Number of samples to use for training (-1 for all)
-    batch_size: 128  # Batch size for training
-    num_epochs: 10  # Number of training epochs
+    num_samples: -1  # Number of samples to use for training (-1 for all)
+    batch_size: 512  # Batch size for training
+    num_epochs: 1  # Number of training epochs
 
   # Phase 2: Domain-specific clean images for optional LoRA adaptation
   domain:
-    clean_path: images_without_patches  # Path to clean images of target domain
-    num_samples: 50  # Number of clean samples (-1 for all available)
-    batch_size: 32  # Batch size for adaptation
-    num_epochs: 5  # Number of adaptation epochs
+    clean_path: /data/coco/train2017  # Path to clean images of target domain
+    num_samples: -1  # Number of clean samples (-1 for all available)
+    batch_size: 512  # Batch size for adaptation
+    num_epochs: 3  # Number of adaptation epochs
 
   # Phase 3: Test images (with potential patches)
   test:
-    patch_path: images_with_patches  # Path to test images
-    batch_size: 32  # Batch size for testing
+    patch_path: /home/junesang/ImageNet-Patch/coco_with_patches  # Path to test images
+    batch_size: 64  # Batch size for testing
 
 # Model configuration
 model:
   # Feature extraction settings
-  spatial_resolution: 7  # Spatial resolution for feature extraction (7, 14, 28, 56)
-  feature_dim: 128  # Feature dimension after channel pooling
+  spatial_resolution: 14  # Spatial resolution for feature extraction (7, 14, 28, 56)
+  feature_dim: 256  # Feature dimension after channel pooling
 
   # Trajectory processing options
   trajectory:
@@ -48,54 +48,57 @@ model:
       start: 0.8  # Scale factor for earliest layer
       end: 1.2  # Scale factor for deepest layer
 
-  # Model architecture selection: 'autoencoder', 'vae', 'transformer'
-  type: autoencoder  # Choose time-series anomaly detection model
+  # Model architecture selection: 'autoencoder', 'vae', 'tcn_autoencoder', 'tcn_vae', 'transformer'
+  type: tcn_vae  # Choose time-series anomaly detection model
 
   # Model hyperparameters
   hidden_dim: 128  # Hidden dimension for model
   latent_dim: 64  # Latent dimension (for autoencoder/vae)
-  num_layers: 2  # Number of layers
+  num_layers: 3  # Number of layers
   num_heads: 4  # Number of attention heads (for transformer only)
   dropout: 0.1  # Dropout rate (for transformer)
+  tcn_kernel_size: 3  # Kernel size for temporal conv models (odd number recommended)
+  tcn_dilation_base: 2  # Dilation growth factor for temporal conv models
+  tcn_dropout: 0.1  # Dropout inside temporal conv blocks
 
   # Training settings
-  learning_rate: 0.001  # Learning rate for Phase 1 training
+  optimizer: adamw  # Optimizer type ('adam', 'adamw', etc.)
+  learning_rate: 0.003  # Learning rate for Phase 1 training
   weight_decay: 0.0001  # Weight decay (L2 regularization)
   vae_beta_max: 0.001  # Target beta weight for VAE KL term
-  vae_beta_warmup_steps: 2000  # Warmup steps for beta annealing
+  vae_beta_warmup_steps: 100000  # Warmup steps for beta annealing
 
   # Weight management for Phase 1 (Base Model)
   phase1:
     save_weights: true  # Save trained model weights
-    load_weights: false  # Load pre-trained weights if available
+    load_weights: true  # Load pre-trained weights if available
     weights_dir: model_weights  # Directory to save/load weights
     # weights_path is auto-generated based on model config
 
 # Domain Adaptation configuration (Phase 2)
 domain_adaptation:
-  enabled: false  # Enable/disable domain adaptation with LoRA
+  enabled: true  # Enable/disable domain adaptation with LoRA
 
   # LoRA settings
   lora:
     rank: 8  # LoRA rank (lower = fewer parameters, faster training)
     alpha: 16  # LoRA scaling factor
-    target_modules: ['Linear']  # Module types to adapt
-
-  # Training settings
-  learning_rate: 0.0001  # Lower learning rate for fine-tuning
-  weight_decay: 0.0001  # Weight decay
+    target_modules: ['Linear', 'Conv1d']  # Module types to adapt
+    optimizer: adamw  # Optimizer for LoRA training
+    learning_rate: 1e-4  # Lower learning rate for fine-tuning
+    weight_decay: 0.02  # Weight decay
 
   # Weight management for Phase 2 (LoRA Adaptation)
   phase2:
     save_weights: true  # Save LoRA adaptation weights
-    load_weights: false  # Load pre-trained LoRA weights if available
+    load_weights: true  # Load pre-trained LoRA weights if available
     weights_dir: lora_weights  # Directory to save/load LoRA weights
     # weights_path is auto-generated based on model config
 
 # Detection configuration
 detection:
   # Threshold method for anomaly scores: 'mean_std', 'median_mad', 'percentile'
-  threshold_method: percentile
+  threshold_method: mean_std
 
   # Parameters for 'mean_std' method
   threshold_multiplier: 3.0  # Threshold = mean + k*std
@@ -109,6 +112,11 @@ detection:
   # Pixel-level detection threshold
   detection_pixel_threshold: 0  # Minimum number of anomalous pixels to classify as detected
 
+# Evaluation configuration
+evaluation:
+  enable_patch_metrics: true  # Enable evaluation against patch metadata
+  patch_metadata_path: /home/junesang/ImageNet-Patch/coco_with_patches/patch_metadata.json  # Path to patch metadata JSON
+
 # Output configuration
 output:
   dir: detection_results  # Directory to save detection results
@@ -116,6 +124,6 @@ output:
 
 # Experiment Tracking
 experiment:
-  use_wandb: false  # Enable Weights & Biases logging
-  wandb_project: patch-detection  # W&B project name
-  wandb_entity: null  # W&B entity (username/team), null = default
+  use_wandb: true  # Enable Weights & Biases logging
+  wandb_project: TRAP  # W&B project name
+  wandb_entity: medicalissues  # W&B entity (username/team), null = default

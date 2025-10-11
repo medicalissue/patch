@@ -294,6 +294,208 @@ class TimeSeriesVAE(nn.Module):
         return anomaly_scores
 
 
+class TemporalConvBlock(nn.Module):
+    """Residual Temporal Convolution block with dilation."""
+
+    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, dropout=0.1):
+        super().__init__()
+        padding = ((kernel_size - 1) * dilation) // 2
+        self.net = nn.Sequential(
+            nn.Conv1d(in_channels, out_channels, kernel_size, padding=padding, dilation=dilation),
+            nn.BatchNorm1d(out_channels),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+        self.residual = None
+        if in_channels != out_channels:
+            self.residual = nn.Conv1d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        out = self.net(x)
+        res = self.residual(x) if self.residual is not None else x
+        return out + res
+
+
+class TemporalConvAutoencoder(nn.Module):
+    """Temporal Convolutional Autoencoder for trajectory reconstruction."""
+
+    def __init__(
+        self,
+        input_dim,
+        hidden_dim=128,
+        latent_dim=64,
+        num_layers=3,
+        kernel_size=3,
+        dilation_base=2,
+        dropout=0.1,
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.latent_dim = latent_dim
+        self.num_layers = num_layers
+        self.kernel_size = kernel_size
+
+        encoder_blocks = []
+        in_channels = input_dim
+        dilation = 1
+        for _ in range(num_layers):
+            encoder_blocks.append(
+                TemporalConvBlock(
+                    in_channels,
+                    hidden_dim,
+                    kernel_size=kernel_size,
+                    dilation=dilation,
+                    dropout=dropout,
+                )
+            )
+            in_channels = hidden_dim
+            dilation *= dilation_base
+        self.encoder_blocks = nn.ModuleList(encoder_blocks)
+
+        self.encoder_fc = nn.Linear(hidden_dim, latent_dim)
+
+        self.decoder_fc = nn.Linear(latent_dim, hidden_dim)
+        self.decoder_blocks = nn.ModuleList([
+            TemporalConvBlock(
+                hidden_dim,
+                hidden_dim,
+                kernel_size=kernel_size,
+                dilation=1,
+                dropout=dropout,
+            )
+            for _ in range(num_layers)
+        ])
+        self.decoder_output = nn.Conv1d(
+            hidden_dim,
+            input_dim,
+            kernel_size=kernel_size,
+            padding=(kernel_size - 1) // 2,
+        )
+
+    def encode(self, x):
+        # x: [B, L, D]
+        out = x.permute(0, 2, 1)
+        for block in self.encoder_blocks:
+            out = block(out)
+        pooled = out.mean(dim=-1)
+        latent = self.encoder_fc(pooled)
+        return latent
+
+    def decode(self, z, seq_len):
+        hidden = self.decoder_fc(z)  # [B, hidden_dim]
+        out = hidden.unsqueeze(-1).repeat(1, 1, seq_len)
+        for block in self.decoder_blocks:
+            out = block(out)
+        reconstruction = self.decoder_output(out)
+        return reconstruction.permute(0, 2, 1)
+
+    def forward(self, x):
+        latent = self.encode(x)
+        reconstruction = self.decode(latent, x.shape[1])
+        return reconstruction, latent
+
+    def compute_anomaly_score(self, x):
+        reconstruction, _ = self.forward(x)
+        mse = F.mse_loss(reconstruction, x, reduction='none')
+        return mse.mean(dim=[1, 2])
+
+
+class TemporalConvVAE(nn.Module):
+    """Temporal Convolutional VAE for trajectory modelling."""
+
+    def __init__(
+        self,
+        input_dim,
+        hidden_dim=128,
+        latent_dim=64,
+        num_layers=3,
+        kernel_size=3,
+        dilation_base=2,
+        dropout=0.1,
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.latent_dim = latent_dim
+        self.num_layers = num_layers
+
+        encoder_blocks = []
+        in_channels = input_dim
+        dilation = 1
+        for _ in range(num_layers):
+            encoder_blocks.append(
+                TemporalConvBlock(
+                    in_channels,
+                    hidden_dim,
+                    kernel_size=kernel_size,
+                    dilation=dilation,
+                    dropout=dropout,
+                )
+            )
+            in_channels = hidden_dim
+            dilation *= dilation_base
+        self.encoder_blocks = nn.ModuleList(encoder_blocks)
+
+        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
+        self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
+
+        self.decoder_fc = nn.Linear(latent_dim, hidden_dim)
+        self.decoder_blocks = nn.ModuleList([
+            TemporalConvBlock(
+                hidden_dim,
+                hidden_dim,
+                kernel_size=kernel_size,
+                dilation=1,
+                dropout=dropout,
+            )
+            for _ in range(num_layers)
+        ])
+        self.decoder_output = nn.Conv1d(
+            hidden_dim,
+            input_dim,
+            kernel_size=kernel_size,
+            padding=(kernel_size - 1) // 2,
+        )
+
+    def encode(self, x):
+        out = x.permute(0, 2, 1)
+        for block in self.encoder_blocks:
+            out = block(out)
+        pooled = out.mean(dim=-1)
+        mu = self.fc_mu(pooled)
+        logvar = self.fc_logvar(pooled)
+        return mu, logvar
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def decode(self, z, seq_len):
+        hidden = self.decoder_fc(z)
+        out = hidden.unsqueeze(-1).repeat(1, 1, seq_len)
+        for block in self.decoder_blocks:
+            out = block(out)
+        reconstruction = self.decoder_output(out)
+        return reconstruction.permute(0, 2, 1)
+
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        reconstruction = self.decode(z, x.shape[1])
+        return reconstruction, mu, logvar
+
+    def compute_anomaly_score(self, x):
+        reconstruction, mu, logvar = self.forward(x)
+
+        recon_loss = F.mse_loss(reconstruction, x, reduction='none')
+        recon_loss = recon_loss.mean(dim=[1, 2])
+
+        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+
+        return recon_loss + 0.001 * kl_loss
+
 class TimeSeriesTransformer(nn.Module):
     """
     Transformer-based autoencoder for time-series anomaly detection
@@ -482,7 +684,56 @@ class LoRALayer(nn.Module):
         return original_output + self.scaling * lora_output
 
 
-def apply_lora_to_model(model, rank=8, alpha=16, target_modules=['Linear']):
+class LoRAConv1d(nn.Module):
+    """LoRA adaptation for 1D convolutional layers."""
+
+    def __init__(self, module, rank=8, alpha=16):
+        super().__init__()
+        if module.groups != 1:
+            raise ValueError("LoRAConv1d currently supports groups=1 only")
+
+        self.rank = rank
+        self.alpha = alpha
+        self.scaling = alpha / rank
+
+        self.in_channels = module.in_channels
+        self.out_channels = module.out_channels
+        self.kernel_size = module.kernel_size if isinstance(module.kernel_size, tuple) else (module.kernel_size,)
+        self.stride = module.stride
+        self.padding = module.padding
+        self.dilation = module.dilation
+        self.groups = module.groups
+
+        effective_in = self.in_channels * self.kernel_size[0]
+
+        self.lora_A = nn.Parameter(torch.zeros(rank, effective_in))
+        self.lora_B = nn.Parameter(torch.zeros(self.out_channels, rank))
+
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+
+    def forward(self, x, original_output):
+        delta_weight = torch.matmul(self.lora_B, self.lora_A)
+        delta_weight = delta_weight.view(self.out_channels, self.in_channels, self.kernel_size[0])
+        delta = F.conv1d(
+            x,
+            delta_weight,
+            bias=None,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=self.groups,
+        )
+        return original_output + self.scaling * delta
+
+
+def apply_lora_to_model(
+    model,
+    rank=8,
+    alpha=16,
+    target_modules=['Linear'],
+    target_name_keywords=None,
+):
     """
     Apply LoRA to specified modules in a model
 
@@ -492,16 +743,34 @@ def apply_lora_to_model(model, rank=8, alpha=16, target_modules=['Linear']):
         alpha: LoRA alpha scaling factor
         target_modules: List of module types to adapt (e.g., ['Linear', 'LSTM'])
 
+    Args:
+        model: PyTorch model to adapt
+        rank: LoRA rank
+        alpha: LoRA alpha scaling factor
+        target_modules: List of module types to adapt (e.g., ['Linear', 'LSTM'])
+        target_name_keywords: Optional list of substrings the module name must contain
+            (case-insensitive). If provided, only modules whose names include at least
+            one of the keywords are adapted.
+
     Returns:
         model: Model with LoRA layers attached
         lora_params: List of LoRA parameters for training
     """
     lora_params = []
+    if target_name_keywords is None:
+        target_name_keywords = []
+    lowered_keywords = [kw.lower() for kw in target_name_keywords]
 
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear) and 'Linear' in target_modules:
-            # Create LoRA layer
-            lora = LoRALayer(module.in_features, module.out_features, rank, alpha)
+            if lowered_keywords:
+                lowered_name = name.lower()
+                if not any(keyword in lowered_name for keyword in lowered_keywords):
+                    continue
+
+            # Create LoRA layer on same device as the frozen weights to avoid CPU/GPU mismatch
+            weight_device = module.weight.device if module.weight is not None else next(module.parameters()).device
+            lora = LoRALayer(module.in_features, module.out_features, rank, alpha).to(weight_device)
 
             # Attach LoRA to module
             setattr(module, 'lora', lora)
@@ -521,22 +790,60 @@ def apply_lora_to_model(model, rank=8, alpha=16, target_modules=['Linear']):
                 return lora(x, original_output)
             module.forward = forward_with_lora
 
+        elif isinstance(module, nn.Conv1d) and 'Conv1d' in target_modules:
+            if lowered_keywords:
+                lowered_name = name.lower()
+                if not any(keyword in lowered_name for keyword in lowered_keywords):
+                    continue
+
+            weight_device = module.weight.device if module.weight is not None else next(module.parameters()).device
+            lora = LoRAConv1d(module, rank, alpha).to(weight_device)
+
+            setattr(module, 'lora', lora)
+
+            module.weight.requires_grad = False
+            if module.bias is not None:
+                module.bias.requires_grad = False
+
+            lora_params.extend(lora.parameters())
+
+            original_forward = module.forward
+
+            def forward_with_lora_conv(x, original_forward=original_forward, lora=lora):
+                original_output = original_forward(x)
+                return lora(x, original_output)
+
+            module.forward = forward_with_lora_conv
+
     print(f"  ✓ Applied LoRA: {len(lora_params)} trainable parameter tensors")
 
     return model, lora_params
 
 
-def create_model(model_type, input_dim, hidden_dim=128, latent_dim=64, num_layers=2, num_heads=4):
+def create_model(
+    model_type,
+    input_dim,
+    hidden_dim=128,
+    latent_dim=64,
+    num_layers=2,
+    num_heads=4,
+    tcn_kernel_size=3,
+    tcn_dilation_base=2,
+    tcn_dropout=0.1,
+):
     """
     Factory function to create time-series anomaly detection model
 
     Args:
-        model_type: 'autoencoder', 'vae', or 'transformer'
+        model_type: 'autoencoder', 'vae', 'tcn_autoencoder', 'tcn_vae', or 'transformer'
         input_dim: Feature dimension (D)
         hidden_dim: Hidden dimension
         latent_dim: Latent dimension (for autoencoder/vae)
         num_layers: Number of layers
         num_heads: Number of attention heads (for transformer)
+        tcn_kernel_size: Convolution kernel size for temporal conv models
+        tcn_dilation_base: Dilation growth factor for temporal conv models
+        tcn_dropout: Dropout rate inside temporal conv blocks
 
     Returns:
         model: PyTorch model
@@ -550,7 +857,30 @@ def create_model(model_type, input_dim, hidden_dim=128, latent_dim=64, num_layer
         return TimeSeriesAutoencoder(input_dim, hidden_dim, latent_dim, num_layers)
     elif model_type == 'vae':
         return TimeSeriesVAE(input_dim, hidden_dim, latent_dim, num_layers)
+    elif model_type == 'tcn_autoencoder':
+        return TemporalConvAutoencoder(
+            input_dim,
+            hidden_dim,
+            latent_dim,
+            num_layers,
+            kernel_size=tcn_kernel_size,
+            dilation_base=tcn_dilation_base,
+            dropout=tcn_dropout,
+        )
+    elif model_type == 'tcn_vae':
+        return TemporalConvVAE(
+            input_dim,
+            hidden_dim,
+            latent_dim,
+            num_layers,
+            kernel_size=tcn_kernel_size,
+            dilation_base=tcn_dilation_base,
+            dropout=tcn_dropout,
+        )
     elif model_type == 'transformer':
         return TimeSeriesTransformer(input_dim, hidden_dim, num_heads, num_layers)
     else:
-        raise ValueError(f"Unsupported model_type: {model_type}. Choose from 'autoencoder', 'vae', 'transformer'")
+        raise ValueError(
+            f"Unsupported model_type: {model_type}. Choose from "
+            "'autoencoder', 'vae', 'tcn_autoencoder', 'tcn_vae', 'transformer'"
+        )

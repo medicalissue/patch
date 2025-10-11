@@ -11,15 +11,20 @@ Phase 3: Testing - Detect patches in test images using reconstruction error
 Configuration is managed via Hydra for flexibility and reproducibility.
 """
 
-import torch
-import torch.nn.functional as F
-from torchvision import models, transforms
-from torch.utils.data import DataLoader, Subset
-from pathlib import Path
+import json
 import time
+from pathlib import Path
+
 import hydra
-from omegaconf import DictConfig, OmegaConf
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import matplotlib.pyplot as plt
+from omegaconf import DictConfig, OmegaConf
+from PIL import Image, ImageDraw
+from torch.utils.data import DataLoader, Subset
+from torchvision import models, transforms
 from tqdm import tqdm
 
 from attracter import ModelTrainer
@@ -28,6 +33,154 @@ from detector import PatchDetector
 from extracter import ActivationExtractor
 from trajectory import stack_trajectory
 from visualize import visualize_results
+
+
+class Conv2dWithReflectionPadding(nn.Module):
+    """
+    Wraps a Conv2d to apply reflection padding instead of zero padding.
+    """
+
+    def __init__(self, conv: nn.Conv2d):
+        super().__init__()
+        if isinstance(conv.padding, tuple):
+            pad_h, pad_w = conv.padding
+        else:
+            pad_h = pad_w = conv.padding
+
+        self.pad_h = pad_h
+        self.pad_w = pad_w
+
+        # Clone the original conv without padding
+        self.conv = nn.Conv2d(
+            conv.in_channels,
+            conv.out_channels,
+            kernel_size=conv.kernel_size,
+            stride=conv.stride,
+            padding=0,
+            dilation=conv.dilation,
+            groups=conv.groups,
+            bias=conv.bias is not None
+        )
+        self.conv.weight.data.copy_(conv.weight.data)
+        if conv.bias is not None:
+            self.conv.bias.data.copy_(conv.bias.data)
+
+        # Preserve gradients requirement
+        self.conv.weight.requires_grad = conv.weight.requires_grad
+        if self.conv.bias is not None:
+            self.conv.bias.requires_grad = conv.bias.requires_grad
+
+    def forward(self, x):
+        if self.pad_h or self.pad_w:
+            padding = (self.pad_w, self.pad_w, self.pad_h, self.pad_h)
+            x = F.pad(x, padding, mode='reflect')
+        return self.conv(x)
+
+
+def convert_conv_layers_to_reflection(module: nn.Module):
+    """
+    Recursively replace Conv2d layers with reflection-padding equivalents.
+    """
+    for name, child in module.named_children():
+        if isinstance(child, nn.Conv2d) and any(child.padding):
+            wrapped = Conv2dWithReflectionPadding(child)
+            module._modules[name] = wrapped
+        else:
+            convert_conv_layers_to_reflection(child)
+
+
+def _normalize_polygon(points):
+    normalized = []
+    for pt in points:
+        if isinstance(pt, dict):
+            x = float(pt.get('x', 0.0))
+            y = float(pt.get('y', 0.0))
+        elif isinstance(pt, (list, tuple)) and len(pt) >= 2:
+            x = float(pt[0])
+            y = float(pt[1])
+        else:
+            continue
+        normalized.append((x, y))
+    return normalized
+
+
+def _extract_polygons(entry):
+    polygons = []
+    if not isinstance(entry, dict):
+        return polygons
+
+    if 'patch_corners' in entry:
+        poly = _normalize_polygon(entry['patch_corners'])
+        if len(poly) >= 3:
+            polygons.append(poly)
+
+    if 'patches' in entry and isinstance(entry['patches'], list):
+        for patch in entry['patches']:
+            corners = patch.get('patch_corners') or patch.get('corners') or patch.get('points')
+            poly = _normalize_polygon(corners or [])
+            if len(poly) >= 3:
+                polygons.append(poly)
+
+    if 'polygons' in entry and isinstance(entry['polygons'], list):
+        for poly_entry in entry['polygons']:
+            poly = _normalize_polygon(poly_entry)
+            if len(poly) >= 3:
+                polygons.append(poly)
+
+    return polygons
+
+
+def load_patch_metadata(metadata_path):
+    metadata_path = Path(metadata_path)
+    with metadata_path.open('r') as f:
+        data = json.load(f)
+
+    if isinstance(data, dict):
+        images = data.get('images') or data.get('data') or []
+    elif isinstance(data, list):
+        images = data
+    else:
+        images = []
+
+    metadata = {}
+    for entry in images:
+        polygons = _extract_polygons(entry)
+        keys = set()
+        for key_name in ('filename', 'original_filename', 'image'):
+            key_val = entry.get(key_name)
+            if key_val:
+                keys.add(key_val)
+        if not keys and 'id' in entry:
+            keys.add(str(entry['id']))
+
+        if not keys:
+            continue
+
+        for key in keys:
+            existing = metadata.setdefault(key, [])
+            existing.extend(polygons)
+
+    return metadata
+
+
+def create_polygon_mask(polygons, height, width):
+    if not polygons:
+        return np.zeros((height, width), dtype=bool)
+
+    mask_img = Image.new('L', (width, height), 0)
+    draw = ImageDraw.Draw(mask_img)
+    for poly in polygons:
+        if len(poly) < 3:
+            continue
+        clamped = []
+        for x, y in poly:
+            cx = max(0.0, min(float(x), width - 1))
+            cy = max(0.0, min(float(y), height - 1))
+            clamped.append((cx, cy))
+        if len(clamped) >= 3:
+            draw.polygon(clamped, outline=1, fill=1)
+
+    return np.array(mask_img, dtype=bool)
 
 
 def print_phase_header(phase_num: int, phase_name: str):
@@ -74,6 +227,8 @@ def main(cfg: DictConfig):
     # Load ResNet50 model
     print("\nLoading ResNet50 model...")
     model = models.resnet50(pretrained=True)
+    convert_conv_layers_to_reflection(model)
+    print("✓ Converted ResNet convolutions to reflection padding")
     model.eval()
     model.to(device)
     print("✓ Model loaded successfully")
@@ -377,6 +532,17 @@ def main(cfg: DictConfig):
         extractor.remove_hooks()
         return
 
+    patch_eval_enabled = False
+    patch_metadata_map = {}
+    missing_metadata = set()
+    eval_pixel_tp = eval_pixel_fp = eval_pixel_fn = eval_pixel_tn = 0
+    eval_images = 0
+    eval_images_with_patch = 0
+    eval_images_detected = 0
+    eval_images_missed = 0
+    eval_images_false_alarm = 0
+    gt_mask_cache = {}
+
     try:
         patch_dataset = LocalImageDataset(patch_folder, transform=transform)
         patch_loader = DataLoader(
@@ -397,6 +563,43 @@ def main(cfg: DictConfig):
         visualization_dir = output_dir / "visualize_results"
         visualization_dir.mkdir(parents=True, exist_ok=True)
         print(f"✓ Visualization directory: {visualization_dir}")
+
+        evaluation_cfg = getattr(cfg, 'evaluation', None)
+
+        def _eval_cfg_get(key, default=None):
+            if evaluation_cfg is None:
+                return default
+            if isinstance(evaluation_cfg, dict):
+                return evaluation_cfg.get(key, default)
+            return getattr(evaluation_cfg, key, default)
+
+        patch_eval_enabled = bool(_eval_cfg_get('enable_patch_metrics', False))
+        patch_metadata_map = {}
+        missing_metadata = set()
+        eval_pixel_tp = eval_pixel_fp = eval_pixel_fn = eval_pixel_tn = 0
+        eval_images = 0
+        eval_images_with_patch = 0
+        eval_images_detected = 0
+        eval_images_missed = 0
+        eval_images_false_alarm = 0
+        gt_mask_cache = {}
+
+        if patch_eval_enabled:
+            metadata_path_value = _eval_cfg_get('patch_metadata_path', '')
+            metadata_path = Path(metadata_path_value)
+            if not metadata_path.is_absolute():
+                metadata_path = Path(metadata_path_value)
+
+            if not metadata_path.exists():
+                print(f"\n⚠ Warning: Patch metadata not found: {metadata_path}. Disabling patch metrics.")
+                patch_eval_enabled = False
+            else:
+                try:
+                    patch_metadata_map = load_patch_metadata(metadata_path)
+                    print(f"✓ Loaded patch metadata for {len(patch_metadata_map)} images")
+                except Exception as meta_exc:
+                    print(f"\n⚠ Warning: Failed to load patch metadata: {meta_exc}. Disabling patch metrics.")
+                    patch_eval_enabled = False
 
         # Process test images
         print(f"\nProcessing test images...")
@@ -442,6 +645,56 @@ def main(cfg: DictConfig):
                     'is_detected': is_detected
                 })
 
+                if patch_eval_enabled:
+                    polygons = None
+                    for key in (img_name, Path(img_name).name):
+                        if key in patch_metadata_map:
+                            polygons = patch_metadata_map[key]
+                            break
+
+                    if polygons is None:
+                        missing_metadata.add(img_name)
+                    else:
+                        height, width = img.shape[1], img.shape[2]
+                        with torch.no_grad():
+                            pred_mask_tensor = patch_mask.unsqueeze(0).unsqueeze(0).float()
+                            upsampled = F.interpolate(
+                                pred_mask_tensor,
+                                size=(height, width),
+                                mode='nearest'
+                            )
+                        pred_mask_np = (upsampled[0, 0].detach().cpu().numpy() >= 0.5)
+
+                        cache_key = (img_name, height, width)
+                        if cache_key not in gt_mask_cache:
+                            gt_mask_cache[cache_key] = create_polygon_mask(polygons, height, width)
+                        gt_mask_np = gt_mask_cache[cache_key]
+
+                        pred_bool = pred_mask_np.astype(bool)
+                        gt_bool = gt_mask_np.astype(bool)
+
+                        eval_pixel_tp += int(np.logical_and(pred_bool, gt_bool).sum())
+                        eval_pixel_fp += int(np.logical_and(pred_bool, np.logical_not(gt_bool)).sum())
+                        eval_pixel_fn += int(np.logical_and(np.logical_not(pred_bool), gt_bool).sum())
+                        eval_pixel_tn += int(np.logical_and(np.logical_not(pred_bool), np.logical_not(gt_bool)).sum())
+
+                        intersect = bool(np.logical_and(pred_bool, gt_bool).any())
+                        pred_any = bool(pred_bool.any())
+                        gt_any = bool(gt_bool.any())
+
+                        eval_images += 1
+                        if gt_any:
+                            eval_images_with_patch += 1
+                            if intersect:
+                                eval_images_detected += 1
+                            else:
+                                eval_images_missed += 1
+                                if pred_any:
+                                    eval_images_false_alarm += 1
+                        else:
+                            if pred_any:
+                                eval_images_false_alarm += 1
+
                 # Visualize and save (first item per batch)
                 if cfg.output.save_visualizations:
                     if not batch_visualized:
@@ -462,7 +715,8 @@ def main(cfg: DictConfig):
                             detection_pixel_threshold=cfg.detection.detection_pixel_threshold,
                             threshold_method=threshold_method_name,
                             threshold_formula=threshold_formula,
-                            model_type=cfg.model.type
+                            model_type=cfg.model.type,
+                            trajectories=embeddings_batch[b]
                         )
 
                         viz_filename = f"batch{batch_idx:04d}_{Path(img_name).stem}.png"
@@ -498,6 +752,30 @@ def main(cfg: DictConfig):
     print(f"  Detected: {total_detected}")
     print(f"  Clean:    {len(results) - total_detected}")
     print(f"  Rate:     {detection_rate:.1f}%")
+
+    if patch_eval_enabled:
+        evaluated_pixels = eval_pixel_tp + eval_pixel_fp + eval_pixel_fn + eval_pixel_tn
+        if evaluated_pixels > 0:
+            accuracy = (eval_pixel_tp + eval_pixel_tn) / evaluated_pixels
+            precision = eval_pixel_tp / (eval_pixel_tp + eval_pixel_fp) if (eval_pixel_tp + eval_pixel_fp) > 0 else 0.0
+            recall = eval_pixel_tp / (eval_pixel_tp + eval_pixel_fn) if (eval_pixel_tp + eval_pixel_fn) > 0 else 0.0
+            f1_score = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+
+            print(f"\nPatch Localization Metrics (pixel-level):")
+            print(f"  Evaluated images:          {eval_images}")
+            print(f"  Accuracy:                  {accuracy * 100:.2f}%")
+            print(f"  Precision:                 {precision * 100:.2f}%")
+            print(f"  Recall:                    {recall * 100:.2f}%")
+            print(f"  F1 Score:                  {f1_score * 100:.2f}%")
+            print(f"  Images with patch:         {eval_images_with_patch}")
+            print(f"    Detected (overlap >0):   {eval_images_detected}")
+            print(f"    Missed patches:          {eval_images_missed}")
+            print(f"  False-alarm images:        {eval_images_false_alarm}")
+        if missing_metadata:
+            missing_list = sorted(list(missing_metadata))
+            preview = ', '.join(missing_list[:5])
+            more = '' if len(missing_list) <= 5 else f", ... (+{len(missing_list) - 5} more)"
+            print(f"\n⚠ Warning: Missing patch metadata for {len(missing_list)} images: {preview}{more}")
 
     print(f"\nScore Statistics:")
     if len(results) > 0:
