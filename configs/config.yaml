@@ -1,10 +1,10 @@
 # ===================================================================
-# Few-shot Image Patch Detection System Configuration
+# Model-based Patch Detection System Configuration
 # ===================================================================
 # Architecture:
-#   Phase 1: Few-shot Base Learning - Learn normal trajectory characteristics from ImageNet
-#   Phase 2: Few-shot Adaptation - Set adaptive threshold using domain-specific clean images
-#   Phase 3: Testing - Detect patches in test images
+#   Phase 1: Model Training - Train anomaly detection model on clean ImageNet images
+#   Phase 2 (Optional): Domain Adaptation - LoRA-based fine-tuning on domain clean images
+#   Phase 3: Testing - Detect patches in test images using reconstruction error
 # ===================================================================
 
 # Device configuration
@@ -14,54 +14,88 @@ device:
 
 # Data configuration
 data:
-  # Phase 1: ImageNet data for learning base normal characteristics
+  # Phase 1: ImageNet data for model training (clean images only)
   imagenet:
     path: /data/ImageNet/train  # Path to ImageNet training data
-    num_samples: 1000  # Number of samples to use for learning (-1 for all)
-    batch_size: 128  # Batch size for processing
+    num_samples: 1000  # Number of samples to use for training (-1 for all)
+    batch_size: 128  # Batch size for training
+    num_epochs: 10  # Number of training epochs
 
-  # Attractor cache configuration
-  attractor:
-    cache_dir: attractor_cache  # Directory to save/load attractor statistics
-    use_cache: true  # Whether to use cached attractor if available
-    force_recompute: false  # Force recompute even if cache exists
-
-  # Phase 2: Domain-specific clean images for threshold adaptation
+  # Phase 2: Domain-specific clean images for optional LoRA adaptation
   domain:
     clean_path: images_without_patches  # Path to clean images of target domain
     num_samples: 50  # Number of clean samples (-1 for all available)
-    batch_size: 32  # Batch size for processing
+    batch_size: 32  # Batch size for adaptation
+    num_epochs: 5  # Number of adaptation epochs
 
   # Phase 3: Test images (with potential patches)
   test:
     patch_path: images_with_patches  # Path to test images
-    batch_size: 32  # Batch size for processing
+    batch_size: 32  # Batch size for testing
 
 # Model configuration
 model:
+  # Feature extraction settings
   spatial_resolution: 7  # Spatial resolution for feature extraction (7, 14, 28, 56)
   feature_dim: 128  # Feature dimension after channel pooling
 
+  # Model architecture selection: 'autoencoder', 'vae', 'transformer'
+  type: autoencoder  # Choose time-series anomaly detection model
+
+  # Model hyperparameters
+  hidden_dim: 128  # Hidden dimension for model
+  latent_dim: 64  # Latent dimension (for autoencoder/vae)
+  num_layers: 2  # Number of layers
+  num_heads: 4  # Number of attention heads (for transformer only)
+  dropout: 0.1  # Dropout rate (for transformer)
+
+  # Training settings
+  learning_rate: 0.001  # Learning rate for Phase 1 training
+  weight_decay: 0.0001  # Weight decay (L2 regularization)
+
+  # Weight management for Phase 1 (Base Model)
+  phase1:
+    save_weights: true  # Save trained model weights
+    load_weights: false  # Load pre-trained weights if available
+    weights_dir: model_weights  # Directory to save/load weights
+    # weights_path is auto-generated based on model config
+
+# Domain Adaptation configuration (Phase 2)
+domain_adaptation:
+  enabled: false  # Enable/disable domain adaptation with LoRA
+
+  # LoRA settings
+  lora:
+    rank: 8  # LoRA rank (lower = fewer parameters, faster training)
+    alpha: 16  # LoRA scaling factor
+    target_modules: ['Linear']  # Module types to adapt
+
+  # Training settings
+  learning_rate: 0.0001  # Lower learning rate for fine-tuning
+  weight_decay: 0.0001  # Weight decay
+
+  # Weight management for Phase 2 (LoRA Adaptation)
+  phase2:
+    save_weights: true  # Save LoRA adaptation weights
+    load_weights: false  # Load pre-trained LoRA weights if available
+    weights_dir: lora_weights  # Directory to save/load LoRA weights
+    # weights_path is auto-generated based on model config
+
 # Detection configuration
 detection:
-  # Score fusion method: 'voting', 'weighted_voting', 'all', 'any'
-  fusion_method: voting
+  # Threshold method for anomaly scores: 'mean_std', 'median_mad', 'percentile'
+  threshold_method: percentile
 
-  # Voting threshold (number of scores that must be anomalous)
-  voting_threshold: 3  # At least 3 out of 4 scores (majority voting)
+  # Parameters for 'mean_std' method
+  threshold_multiplier: 3.0  # Threshold = mean + k*std
 
-  # Per-score threshold method: 'mean_std', 'median_mad', 'percentile'
-  score_threshold_method: median_mad
+  # Parameters for 'median_mad' method (robust to outliers)
+  mad_multiplier: 3.0  # Threshold = median + c*MAD
 
-  # Parameters for 'mean_std' method (per score)
-  threshold_multiplier: 2.0  # Threshold = mean + k*std
-
-  # Parameters for 'median_mad' method (per score)
-  mad_multiplier: 3.0  # Threshold = median + c*MAD (robust to outliers)
-
-  # Parameters for 'percentile' method (per score)
+  # Parameters for 'percentile' method
   percentile: 95.0  # Use this percentile as threshold
 
+  # Pixel-level detection threshold
   detection_pixel_threshold: 0  # Minimum number of anomalous pixels to classify as detected
 
 # Output configuration

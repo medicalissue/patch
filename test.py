@@ -1,13 +1,12 @@
 """
-Few-shot Image Patch Detection System
+Model-based Image Patch Detection System
 
-This system detects adversarial patches in images using a Few-shot learning approach
-with three phases:
+This system detects adversarial patches in images using neural network models
+trained on clean trajectories with three phases:
 
-Phase 1: Setup - Load model and extractor
-Phase 2: Few-shot Base Learning - Learn normal trajectory characteristics from ImageNet
-Phase 3: Few-shot Threshold Adaptation - Set adaptive threshold using domain clean images
-Phase 4: Testing - Detect patches in test images
+Phase 1: Model Training - Train anomaly detection model on clean ImageNet images
+Phase 2 (Optional): Domain Adaptation - LoRA-based fine-tuning on domain clean images
+Phase 3: Testing - Detect patches in test images using reconstruction error
 
 Configuration is managed via Hydra for flexibility and reproducibility.
 """
@@ -23,7 +22,7 @@ from omegaconf import DictConfig, OmegaConf
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-from attracter import AttractorLearner
+from attracter import ModelTrainer
 from dataloader import LocalImageDataset
 from detector import PatchDetector
 from extracter import ActivationExtractor
@@ -41,7 +40,7 @@ def print_phase_header(phase_num: int, phase_name: str):
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(cfg: DictConfig):
     """
-    Main function for Few-shot patch detection
+    Main function for model-based patch detection
 
     Args:
         cfg: Hydra configuration object
@@ -50,7 +49,7 @@ def main(cfg: DictConfig):
     # INITIAL SETUP
     # =========================================================================
     print("=" * 80)
-    print("FEW-SHOT IMAGE PATCH DETECTION SYSTEM")
+    print("MODEL-BASED IMAGE PATCH DETECTION SYSTEM")
     print("=" * 80)
     print("\nConfiguration:")
     print(OmegaConf.to_yaml(cfg))
@@ -58,9 +57,9 @@ def main(cfg: DictConfig):
     start_time_total = time.time()
 
     # =========================================================================
-    # PHASE 1: SETUP
+    # PHASE 0: SETUP
     # =========================================================================
-    print_phase_header(1, "SETUP")
+    print_phase_header(0, "SETUP")
 
     # Device configuration
     device_str = f"cuda:{cfg.device.cuda_id}"
@@ -100,48 +99,61 @@ def main(cfg: DictConfig):
     ])
 
     # =========================================================================
-    # PHASE 2: FEW-SHOT BASE LEARNING
+    # PHASE 1: MODEL TRAINING
     # =========================================================================
-    print_phase_header(2, "FEW-SHOT BASE LEARNING")
-    print("Learning normal trajectory characteristics from ImageNet samples")
+    print_phase_header(1, "MODEL TRAINING")
+    print("Training anomaly detection model on clean ImageNet images")
+    print(f"Model type: {cfg.model.type}")
     print(f"ImageNet path: {cfg.data.imagenet.path}")
     print(f"Number of samples: {cfg.data.imagenet.num_samples}")
     print(f"Batch size: {cfg.data.imagenet.batch_size}")
+    print(f"Training epochs: {cfg.data.imagenet.num_epochs}")
 
-    phase2_start = time.time()
+    phase1_start = time.time()
 
-    # Check for cached attractor
-    attractor_learner = AttractorLearner(device=device)
-    use_cache = cfg.data.attractor.use_cache
-    force_recompute = cfg.data.attractor.force_recompute
-    cache_dir = Path(cfg.data.attractor.cache_dir)
+    # Create model trainer
+    model_trainer = ModelTrainer(
+        model_type=cfg.model.type,
+        input_dim=cfg.model.feature_dim,
+        device=device,
+        model_cfg=cfg.model
+    )
 
-    # Generate cache filename based on configuration
-    cache_filename = AttractorLearner.get_cache_filename(
+    # Check for saved weights
+    use_saved_weights = cfg.model.phase1.load_weights
+    save_weights = cfg.model.phase1.save_weights
+    weights_dir = Path(cfg.model.phase1.weights_dir)
+
+    # Generate weights filename
+    weights_filename = ModelTrainer.get_weights_filename(
+        cfg.model.type,
         cfg.data.imagenet.path,
         cfg.data.imagenet.num_samples,
         cfg.model.spatial_resolution,
-        cfg.model.feature_dim
+        cfg.model.feature_dim,
+        cfg.model.hidden_dim,
+        cfg.model.latent_dim,
+        cfg.model.num_layers
     )
-    cache_path = cache_dir / cache_filename
+    weights_path = weights_dir / weights_filename
 
-    # Try to load cached attractor
-    attractor_loaded = False
-    if use_cache and not force_recompute and cache_path.exists():
+    # Try to load saved weights
+    model_loaded = False
+    if use_saved_weights and weights_path.exists():
         try:
-            print(f"\n✓ Found cached attractor: {cache_path}")
-            print(f"  Loading cached attractor...")
-            attractor_learner.load(cache_path)
-            attractor_loaded = True
-            phase2_time = time.time() - phase2_start
-            print(f"\n✓ Attractor loaded in {phase2_time:.2f}s")
+            print(f"\n✓ Found saved model weights: {weights_path}")
+            print(f"  Loading model weights...")
+            model_trainer.load_weights(weights_path)
+            model_loaded = True
+            phase1_time = time.time() - phase1_start
+            print(f"\n✓ Model loaded in {phase1_time:.2f}s")
         except Exception as e:
-            print(f"\n⚠ Warning: Failed to load cache: {e}")
-            print(f"  Will recompute attractor...")
-            attractor_loaded = False
+            print(f"\n⚠ Warning: Failed to load weights: {e}")
+            print(f"  Will train model from scratch...")
+            model_loaded = False
 
-    if not attractor_loaded:
-        print(f"\n  Computing attractor from scratch...")
+    if not model_loaded:
+        print(f"\n  Training model from scratch...")
 
         try:
             from torchvision.datasets import ImageFolder
@@ -165,12 +177,13 @@ def main(cfg: DictConfig):
                 pin_memory=True
             )
 
-            print(f"✓ Using {num_samples} samples for base learning")
+            print(f"✓ Using {num_samples} samples for training")
 
-            # Extract embeddings and incrementally update attractor
-            print("\nExtracting trajectory embeddings and updating attractor...")
+            # Extract embeddings
+            print("\nExtracting trajectory embeddings from ImageNet...")
+            train_embeddings = []
 
-            for imgs, _ in tqdm(imagenet_loader, desc="  Learning attractor", total=len(imagenet_loader)):
+            for imgs, _ in tqdm(imagenet_loader, desc="  Extracting embeddings", total=len(imagenet_loader)):
                 imgs_gpu = imgs.to(device, non_blocking=True)
 
                 # Extract activations
@@ -180,16 +193,25 @@ def main(cfg: DictConfig):
                 embeddings_batch = stack_trajectory(activations)  # [B, H, W, L, C]
 
                 # Convert batch to list of individual embeddings
-                batch_embeddings = [embeddings_batch[b] for b in range(embeddings_batch.shape[0])]
+                for b in range(embeddings_batch.shape[0]):
+                    train_embeddings.append(embeddings_batch[b])
 
-                # Incrementally update attractor with this batch
-                attractor_learner.partial_fit(batch_embeddings)
+            print(f"\n✓ Extracted {len(train_embeddings)} embeddings")
 
-            total_processed = num_samples
+            # Train model
+            model_trainer.train(
+                train_embeddings,
+                num_epochs=cfg.data.imagenet.num_epochs,
+                batch_size=cfg.data.imagenet.batch_size
+            )
 
-            phase2_time = time.time() - phase2_start
-            print(f"\n✓ Embedding extraction completed in {phase2_time:.2f}s")
-            print(f"  Processed {total_processed} images incrementally")
+            phase1_time = time.time() - phase1_start
+            print(f"\n✓ Model training completed in {phase1_time:.2f}s")
+
+            # Save model weights
+            if save_weights:
+                print(f"\nSaving model weights...")
+                model_trainer.save_weights(weights_path)
 
         except FileNotFoundError as e:
             print(f"\n✗ Error: ImageNet path not found: {cfg.data.imagenet.path}")
@@ -197,118 +219,144 @@ def main(cfg: DictConfig):
             extractor.remove_hooks()
             return
         except Exception as e:
-            print(f"\n✗ Error loading ImageNet: {e}")
+            print(f"\n✗ Error during model training: {e}")
+            import traceback
+            traceback.print_exc()
             extractor.remove_hooks()
             return
 
-        # Finalize attractor statistics
-        print("\nFinalizing normal trajectory characteristics...")
-        attractor_learner.finalize()
-
-        # Save attractor to cache
-        if use_cache:
-            print(f"\nSaving attractor to cache...")
-            attractor_learner.save(cache_path)
-
-    # Create detector (will be updated after Phase 3)
-    detector = None
-    print("\n✓ Phase 2 completed successfully")
+    print("\n✓ Phase 1 completed successfully")
 
     # =========================================================================
-    # PHASE 3: DOMAIN ADAPTATION
+    # PHASE 2: DOMAIN ADAPTATION (OPTIONAL)
     # =========================================================================
-    print_phase_header(3, "DOMAIN ADAPTATION")
-    print("Adapting ImageNet statistics to domain distribution")
-    print(f"Clean images path: {cfg.data.domain.clean_path}")
-    print(f"Number of samples: {cfg.data.domain.num_samples} (-1 = use all)")
-    print(f"Batch size: {cfg.data.domain.batch_size}")
+    if cfg.domain_adaptation.enabled:
+        print_phase_header(2, "DOMAIN ADAPTATION WITH LoRA")
+        print("Fine-tuning model on domain-specific clean images using LoRA")
+        print(f"Clean images path: {cfg.data.domain.clean_path}")
+        print(f"Number of samples: {cfg.data.domain.num_samples} (-1 = use all)")
+        print(f"Batch size: {cfg.data.domain.batch_size}")
+        print(f"Adaptation epochs: {cfg.data.domain.num_epochs}")
 
-    phase3_start = time.time()
+        phase2_start = time.time()
 
-    clean_test_folder = Path(cfg.data.domain.clean_path)
-    domain_stats = None
+        clean_domain_folder = Path(cfg.data.domain.clean_path)
 
-    if clean_test_folder.exists():
-        try:
-            clean_test_dataset = LocalImageDataset(clean_test_folder, transform=transform)
+        if clean_domain_folder.exists():
+            try:
+                clean_domain_dataset = LocalImageDataset(clean_domain_folder, transform=transform)
 
-            # Sample subset if specified
-            if cfg.data.domain.num_samples > 0 and cfg.data.domain.num_samples < len(clean_test_dataset):
-                indices = list(range(cfg.data.domain.num_samples))
-                clean_test_dataset.image_paths = [clean_test_dataset.image_paths[i] for i in indices]
+                # Sample subset if specified
+                if cfg.data.domain.num_samples > 0 and cfg.data.domain.num_samples < len(clean_domain_dataset):
+                    indices = list(range(cfg.data.domain.num_samples))
+                    clean_domain_dataset.image_paths = [clean_domain_dataset.image_paths[i] for i in indices]
 
-            clean_test_loader = DataLoader(
-                clean_test_dataset,
-                batch_size=cfg.data.domain.batch_size,
-                shuffle=False,
-                num_workers=cfg.device.num_workers,
-                pin_memory=True
-            )
+                clean_domain_loader = DataLoader(
+                    clean_domain_dataset,
+                    batch_size=cfg.data.domain.batch_size,
+                    shuffle=False,
+                    num_workers=cfg.device.num_workers,
+                    pin_memory=True
+                )
 
-            print(f"\n✓ Processing {len(clean_test_dataset)} clean images for domain adaptation...")
+                print(f"\n✓ Processing {len(clean_domain_dataset)} clean domain images...")
 
-            # Extract domain embeddings
-            domain_embeddings = []
-            for batch_idx, (imgs, img_names) in enumerate(tqdm(clean_test_loader, desc="  Extracting domain embeddings")):
-                imgs_gpu = imgs.to(device, non_blocking=True)
-                activations = extractor(imgs_gpu)
-                embeddings_batch = stack_trajectory(activations)  # [B, H, W, L, C]
+                # Extract domain embeddings
+                domain_embeddings = []
+                for batch_idx, (imgs, img_names) in enumerate(tqdm(clean_domain_loader, desc="  Extracting domain embeddings")):
+                    imgs_gpu = imgs.to(device, non_blocking=True)
+                    activations = extractor(imgs_gpu)
+                    embeddings_batch = stack_trajectory(activations)  # [B, H, W, L, C]
 
-                for b in range(embeddings_batch.shape[0]):
-                    domain_embeddings.append(embeddings_batch[b])
+                    for b in range(embeddings_batch.shape[0]):
+                        domain_embeddings.append(embeddings_batch[b])
 
-            # Compute domain statistics
-            domain_stats = attractor_learner.adapt_to_domain(domain_embeddings)
+                # Check for saved LoRA weights
+                use_saved_lora = cfg.domain_adaptation.phase2.load_weights
+                save_lora = cfg.domain_adaptation.phase2.save_weights
+                lora_weights_dir = Path(cfg.domain_adaptation.phase2.weights_dir)
 
-            phase3_time = time.time() - phase3_start
-            print(f"\n✓ Domain adaptation completed in {phase3_time:.2f}s")
+                # Generate LoRA weights filename
+                lora_weights_filename = ModelTrainer.get_lora_weights_filename(
+                    cfg.model.type,
+                    cfg.data.domain.clean_path,
+                    cfg.data.domain.num_samples,
+                    cfg.domain_adaptation.lora.rank,
+                    cfg.domain_adaptation.lora.alpha
+                )
+                lora_weights_path = lora_weights_dir / lora_weights_filename
 
-        except FileNotFoundError:
-            print(f"\n⚠ Warning: Clean test folder not found: {clean_test_folder}")
+                # Try to load saved LoRA weights
+                lora_loaded = False
+                if use_saved_lora and lora_weights_path.exists():
+                    try:
+                        print(f"\n✓ Found saved LoRA weights: {lora_weights_path}")
+                        print(f"  Loading LoRA weights...")
+                        model_trainer.load_lora_weights(lora_weights_path)
+                        lora_loaded = True
+                        phase2_time = time.time() - phase2_start
+                        print(f"\n✓ LoRA weights loaded in {phase2_time:.2f}s")
+                    except Exception as e:
+                        print(f"\n⚠ Warning: Failed to load LoRA weights: {e}")
+                        print(f"  Will train LoRA from scratch...")
+                        lora_loaded = False
+
+                if not lora_loaded:
+                    # Apply LoRA and train
+                    model_trainer.adapt_with_lora(
+                        domain_embeddings,
+                        lora_cfg=cfg.domain_adaptation.lora,
+                        num_epochs=cfg.data.domain.num_epochs,
+                        batch_size=cfg.data.domain.batch_size
+                    )
+
+                    phase2_time = time.time() - phase2_start
+                    print(f"\n✓ Domain adaptation completed in {phase2_time:.2f}s")
+
+                    # Save LoRA weights
+                    if save_lora:
+                        print(f"\nSaving LoRA weights...")
+                        model_trainer.save_lora_weights(lora_weights_path)
+
+            except FileNotFoundError:
+                print(f"\n⚠ Warning: Clean domain folder not found: {clean_domain_folder}")
+                print(f"  Skipping domain adaptation")
+                phase2_time = 0
+
+            except Exception as e:
+                print(f"\n⚠ Warning: Error during domain adaptation: {e}")
+                import traceback
+                traceback.print_exc()
+                print(f"  Skipping domain adaptation")
+                phase2_time = 0
+        else:
+            print(f"\n⚠ Warning: Clean domain folder not found: {clean_domain_folder}")
             print(f"  Skipping domain adaptation")
-            domain_stats = None
-            phase3_time = 0
+            phase2_time = 0
 
-        except Exception as e:
-            print(f"\n⚠ Warning: Error during domain adaptation: {e}")
-            print(f"  Skipping domain adaptation")
-            domain_stats = None
-            phase3_time = 0
+        print("\n✓ Phase 2 completed successfully")
     else:
-        print(f"\n⚠ Warning: Clean test folder not found: {clean_test_folder}")
-        print(f"  Skipping domain adaptation")
-        domain_stats = None
-        phase3_time = 0
+        print_phase_header(2, "DOMAIN ADAPTATION (SKIPPED)")
+        print("Domain adaptation is disabled in configuration")
+        phase2_time = 0
 
-    # Create detector with domain adaptation
-    if domain_stats is not None:
-        detector = PatchDetector(
-            attractor_learner,
-            domain_stats=domain_stats,
-            device=device,
-            detection_cfg=cfg.detection
-        )
-    else:
-        print(f"\n⚠ Error: Domain adaptation required but failed")
-        print(f"  Please provide valid domain clean images")
-        extractor.remove_hooks()
-        return
-
-    print("\n✓ Phase 3 completed successfully")
+    # Create detector
+    detector = PatchDetector(
+        model_trainer,
+        device=device,
+        detection_cfg=cfg.detection
+    )
 
     # =========================================================================
-    # PHASE 4: TESTING
+    # PHASE 3: TESTING
     # =========================================================================
-    print_phase_header(4, "TESTING")
-    print("Detecting patches in test images")
+    print_phase_header(3, "TESTING")
+    print("Detecting patches in test images using reconstruction error")
     print(f"Test images path: {cfg.data.test.patch_path}")
     print(f"Batch size: {cfg.data.test.batch_size}")
-    print(f"Fusion method: {cfg.detection.fusion_method}")
-    if cfg.detection.fusion_method == 'voting':
-        print(f"Voting threshold: {cfg.detection.voting_threshold}/6 scores")
     print(f"Output directory: {cfg.output.dir}")
 
-    phase4_start = time.time()
+    phase3_start = time.time()
 
     patch_folder = Path(cfg.data.test.patch_path)
 
@@ -358,15 +406,8 @@ def main(cfg: DictConfig):
                 img = imgs[b]
                 img_name = img_names[b]
 
-                # Detect patches with domain-adapted Mahalanobis distance and per-metric voting
-                (anomaly_map,
-                 patch_mask,
-                 w_map,
-                 st_map,
-                 hht_map,
-                 sst_map,
-                 thresholds,
-                 score_flags) = detector.detect(embeddings_batch[b])
+                # Detect patches using model reconstruction error
+                anomaly_map, patch_mask, threshold = detector.detect(embeddings_batch[b])
 
                 detected_pixels = patch_mask.sum().item()
                 max_score = anomaly_map.max().item()
@@ -375,7 +416,8 @@ def main(cfg: DictConfig):
                 status = "✓ DETECTED" if is_detected else "✗ CLEAN"
 
                 print(f"  [{image_counter}/{len(patch_dataset)}] {img_name:30s} | "
-                      f"Max fusion: {max_score:.3f} | Pixels: {detected_pixels:4d} | {status}")
+                      f"Max score: {max_score:.3f} | Threshold: {threshold:.3f} | "
+                      f"Pixels: {detected_pixels:4d} | {status}")
 
                 # Store results
                 results.append({
@@ -383,20 +425,16 @@ def main(cfg: DictConfig):
                     'name': img_name,
                     'anomaly_map': anomaly_map,
                     'patch_mask': patch_mask,
-                    'w_map': w_map,
-                    'st_map': st_map,
-                    'hht_map': hht_map,
-                    'sst_map': sst_map,
                     'max_score': max_score,
+                    'threshold': threshold,
                     'detected_pixels': detected_pixels,
-                    'is_detected': is_detected,
-                    'thresholds': thresholds
+                    'is_detected': is_detected
                 })
 
-                # Visualize and save (first item per batch with configured thresholds)
+                # Visualize and save (first item per batch)
                 if cfg.output.save_visualizations:
                     if not batch_visualized:
-                        threshold_method_name = str(cfg.detection.score_threshold_method)
+                        threshold_method_name = str(cfg.detection.threshold_method)
                         if threshold_method_name == "mean_std":
                             threshold_formula = f"Threshold = mean + {cfg.detection.threshold_multiplier}*std"
                         elif threshold_method_name == "median_mad":
@@ -408,18 +446,12 @@ def main(cfg: DictConfig):
                             img,
                             anomaly_map,
                             patch_mask,
-                            w_map,
-                            st_map,
-                            hht_map,
-                            sst_map,
-                            score_flags=score_flags,
                             image_name=img_name,
-                            thresholds=thresholds,
+                            threshold=threshold,
                             detection_pixel_threshold=cfg.detection.detection_pixel_threshold,
                             threshold_method=threshold_method_name,
                             threshold_formula=threshold_formula,
-                            fusion_method=cfg.detection.fusion_method,
-                            voting_threshold=cfg.detection.voting_threshold
+                            model_type=cfg.model.type
                         )
 
                         viz_filename = f"batch{batch_idx:04d}_{Path(img_name).stem}.png"
@@ -427,9 +459,9 @@ def main(cfg: DictConfig):
                         plt.close(fig)
                         batch_visualized = True
 
-        phase4_time = time.time() - phase4_start
+        phase3_time = time.time() - phase3_start
 
-        print(f"\n✓ Testing completed in {phase4_time:.2f}s")
+        print(f"\n✓ Testing completed in {phase3_time:.2f}s")
 
     except Exception as e:
         print(f"\n✗ Error during testing: {e}")
@@ -467,27 +499,28 @@ def main(cfg: DictConfig):
     print(f"\n{'=' * 80}")
     print("TIMING")
     print(f"{'=' * 80}")
-    print(f"  Phase 1 (Setup):              {0:.2f}s")
-    print(f"  Phase 2 (Base Learning):      {phase2_time:.2f}s")
-    print(f"  Phase 3 (Domain Adapt):       {phase3_time:.2f}s")
-    print(f"  Phase 4 (Testing):            {phase4_time:.2f}s")
+    print(f"  Phase 0 (Setup):              {0:.2f}s")
+    print(f"  Phase 1 (Model Training):     {phase1_time:.2f}s")
+    print(f"  Phase 2 (Domain Adaptation):  {phase2_time:.2f}s")
+    print(f"  Phase 3 (Testing):            {phase3_time:.2f}s")
     print(f"  {'─' * 78}")
     print(f"  Total:                        {total_time:.2f}s")
 
     if len(results) > 0:
-        print(f"  Avg per test image:           {phase4_time/len(results):.3f}s")
+        print(f"  Avg per test image:           {phase3_time/len(results):.3f}s")
 
     # Cleanup
     extractor.remove_hooks()
 
     print("\n" + "=" * 80)
-    print("✓ FEW-SHOT PATCH DETECTION COMPLETED")
+    print("✓ MODEL-BASED PATCH DETECTION COMPLETED")
     print(f"✓ Results saved to: {output_dir}/")
     print("=" * 80)
     print("\nTo run with different settings, use command-line overrides:")
-    print("  python test.py data.imagenet.num_samples=500")
-    print("  python test.py data.domain.num_samples=100")
-    print("  python test.py model.spatial_resolution=14")
+    print(f"  python test.py model.type=vae")
+    print(f"  python test.py model.type=transformer")
+    print(f"  python test.py domain_adaptation.enabled=true")
+    print(f"  python test.py data.imagenet.num_epochs=20")
     print("=" * 80 + "\n")
 
 

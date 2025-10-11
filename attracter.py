@@ -1,508 +1,413 @@
 """
-AttractorLearner for Few-shot Patch Detection
+ModelTrainer for Model-based Patch Detection
 
-This module learns normal trajectory characteristics from a few ImageNet samples.
-The learned statistics serve as reference for detecting anomalies.
+This module trains time-series anomaly detection models on clean images.
+Three model types are supported:
+1. Autoencoder - LSTM-based reconstruction
+2. VAE - Variational autoencoder with probabilistic modeling
+3. Transformer - Attention-based temporal modeling
 
-Key Statistics:
-  - Spectral: frequency domain characteristics
+Models are trained only on clean trajectories (Phase 1).
+Optional LoRA-based domain adaptation (Phase 2) is supported.
 """
 
 import torch
-import pickle
+import torch.nn as nn
 from pathlib import Path
 import hashlib
-import json
+from tqdm import tqdm
+
+from models import create_model, apply_lora_to_model
 
 
-class AttractorLearner:
+class ModelTrainer:
     """
-    Few-shot Attractor Learner
+    Model-based Anomaly Detection Trainer
 
-    Learns normal trajectory characteristics from clean ImageNet images.
-    All operations are performed on GPU for efficiency.
+    Trains neural network models on clean trajectory data for anomaly detection.
+    Supports saving/loading weights and optional LoRA-based domain adaptation.
 
     Attributes:
+        model: Neural network model (Autoencoder/VAE/Transformer)
         device: Torch device (cuda or cpu)
-        fitted: Whether the learner has been fitted
-        mean_spectrum: Mean spectral power distribution
-        std_spectrum: Std spectral power distribution (for z-score)
-        mean_wavelet: Mean wavelet coefficients
-        cov_inv_wavelet: Inverse covariance matrix for wavelet
-        mean_stft: Mean STFT power
-        cov_inv_stft: Inverse covariance matrix for STFT
-        mean_spectral_entropy: Mean spectral entropy
-        cov_inv_spectral_entropy: Inverse covariance matrix for spectral entropy
-        mean_hf_ratio: Mean high-frequency ratio
-        cov_inv_hf_ratio: Inverse covariance matrix for high-frequency ratio
-        mean_spectral_skewness: Mean spectral skewness
-        cov_inv_spectral_skewness: Inverse covariance matrix for spectral skewness
+        model_type: Type of model ('autoencoder', 'vae', 'transformer')
+        optimizer: PyTorch optimizer for training
+        fitted: Whether the model has been trained
     """
 
-    def __init__(self, device='cuda'):
+    def __init__(self, model_type, input_dim, device='cuda', model_cfg=None):
         """
-        Initialize AttractorLearner
+        Initialize ModelTrainer
 
         Args:
+            model_type: 'autoencoder', 'vae', or 'transformer'
+            input_dim: Feature dimension (D)
             device: Torch device ('cuda' or 'cpu')
+            model_cfg: Model configuration (Hydra DictConfig or dict)
         """
         self.device = device
+        self.model_type = model_type.lower()
+        self.model_cfg = model_cfg or {}
         self.fitted = False
 
-        # Wavelet analysis statistics (Mahalanobis)
-        self.mean_wavelet = None
-        self.cov_inv_wavelet = None
+        # Create model
+        hidden_dim = self._cfg_get('hidden_dim', 128)
+        latent_dim = self._cfg_get('latent_dim', 64)
+        num_layers = self._cfg_get('num_layers', 2)
+        num_heads = self._cfg_get('num_heads', 4)
 
-        # STFT statistics (Mahalanobis)
-        self.mean_stft = None
-        self.cov_inv_stft = None
+        self.model = create_model(
+            model_type=self.model_type,
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            latent_dim=latent_dim,
+            num_layers=num_layers,
+            num_heads=num_heads
+        )
+        self.model.to(device)
 
-        # HHT/EMD statistics (Mahalanobis)
-        self.mean_hht = None
-        self.cov_inv_hht = None
+        # Create optimizer
+        lr = self._cfg_get('learning_rate', 0.001)
+        weight_decay = self._cfg_get('weight_decay', 0.0001)
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=lr,
+            weight_decay=weight_decay
+        )
 
-        # Synchrosqueezed STFT statistics (Mahalanobis)
-        self.mean_sst = None
-        self.cov_inv_sst = None
+        print(f"  ✓ ModelTrainer initialized")
+        print(f"    Model type: {self.model_type}")
+        print(f"    Input dim: {input_dim}")
+        print(f"    Hidden dim: {hidden_dim}")
+        if self.model_type in ['autoencoder', 'vae']:
+            print(f"    Latent dim: {latent_dim}")
+        print(f"    Num layers: {num_layers}")
+        if self.model_type == 'transformer':
+            print(f"    Num heads: {num_heads}")
+        print(f"    Learning rate: {lr}")
 
-        # Incremental statistics (Welford's algorithm)
-        self.n_samples = 0
-        self.M2_wavelet = None  # Sum of squared differences for covariance
-        self.M2_stft = None
-        self.M2_hht = None
-        self.M2_sst = None
+    def _cfg_get(self, key, default):
+        """Safely access configuration values"""
+        cfg = self.model_cfg
+        if cfg is None:
+            return default
+        if isinstance(cfg, dict):
+            return cfg.get(key, default)
+        return getattr(cfg, key, default)
 
-
-    def partial_fit(self, clean_embeddings_gpu):
+    def train(self, train_embeddings_gpu, num_epochs=10, batch_size=128):
         """
-        Incrementally update normal trajectory characteristics from clean images
-
-        This method uses batch-wise Welford's algorithm to compute mean and covariance
-        without loading all data into memory at once. GPU-optimized for speed.
+        Train model on clean embeddings
 
         Args:
-            clean_embeddings_gpu: List of [H, W, L, D] tensors on GPU (mini-batch)
-                                 H, W: spatial dimensions
-                                 L: trajectory length (number of layers)
-                                 D: feature dimension
+            train_embeddings_gpu: List of [H, W, L, D] tensors on GPU (clean images)
+            num_epochs: Number of training epochs
+            batch_size: Batch size for training
 
         Returns:
             self: For method chaining
         """
-        all_wavelets = []
-        all_stfts = []
-        all_hhts = []
-        all_ssts = []
+        print(f"\n  [Phase 1: Model Training]")
+        print(f"  Training {self.model_type} on {len(train_embeddings_gpu)} clean images...")
+        print(f"  Epochs: {num_epochs}, Batch size: {batch_size}")
 
-        # Compute statistics for all embeddings in batch (GPU parallel processing)
-        for emb in clean_embeddings_gpu:
+        # Prepare training data: flatten spatial dimensions
+        all_trajectories = []
+        for emb in train_embeddings_gpu:
             H, W, L, D = emb.shape
-            trajectories = emb.reshape(-1, L, D)
+            trajectories = emb.reshape(-1, L, D)  # [H*W, L, D]
+            all_trajectories.append(trajectories)
 
-            # ===== 1. Wavelet Statistics =====
-            if L >= 2:
-                half_L = L // 2
-                detail = (trajectories[:, :half_L*2:2, :] - trajectories[:, 1:half_L*2:2, :]) / 2
-                wavelet_coeff = torch.abs(detail)
-                all_wavelets.append(wavelet_coeff)
+        # Concatenate all trajectories
+        train_data = torch.cat(all_trajectories, dim=0)  # [N_total, L, D]
+        print(f"    Total trajectories: {train_data.shape[0]}")
 
-            # ===== 2. STFT Statistics =====
-            window_size = max(2, L // 4)
-            stft_powers = []
-            for i in range(0, L - window_size + 1, window_size // 2):
-                window = trajectories[:, i:i+window_size, :]
-                window_fft = torch.fft.rfft(window, dim=1)
-                window_power = torch.abs(window_fft) ** 2
-                log_window_power = torch.log10(window_power + 1e-10)
-                stft_powers.append(log_window_power.mean(dim=1))
+        # Training loop
+        self.model.train()
+        for epoch in range(num_epochs):
+            epoch_loss = 0.0
+            num_batches = 0
 
-            if stft_powers:
-                stft_power = torch.stack(stft_powers, dim=1)
-                all_stfts.append(stft_power)
+            # Shuffle data
+            perm = torch.randperm(train_data.shape[0], device=self.device)
+            shuffled_data = train_data[perm]
 
-            # ===== 3. HHT/EMD Statistics =====
-            residual = trajectories
-            imfs = []
+            # Mini-batch training
+            for i in range(0, train_data.shape[0], batch_size):
+                batch = shuffled_data[i:i+batch_size]
 
-            for _ in range(min(3, L // 2)):
-                if L >= 3:
-                    padded = torch.nn.functional.pad(residual, (0, 0, 1, 1), mode='replicate')
-                    local_mean = (padded[:, :-2, :] + padded[:, 1:-1, :] + padded[:, 2:, :]) / 3.0
-                    imf = residual - local_mean
-                    imfs.append(torch.abs(imf).mean(dim=1))
-                    residual = local_mean
+                # Forward pass
+                self.optimizer.zero_grad()
+
+                if self.model_type == 'vae':
+                    reconstruction, mu, logvar = self.model(batch)
+
+                    # VAE loss: reconstruction + KL divergence
+                    recon_loss = nn.functional.mse_loss(reconstruction, batch)
+                    kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+                    loss = recon_loss + 0.001 * kl_loss  # Weight KL lower
                 else:
-                    break
+                    reconstruction, _ = self.model(batch)
+                    loss = nn.functional.mse_loss(reconstruction, batch)
 
-            if imfs:
-                hht_features = torch.stack(imfs, dim=1)
-                all_hhts.append(hht_features)
+                # Backward pass
+                loss.backward()
+                self.optimizer.step()
 
-            # ===== 4. Synchrosqueezed STFT =====
-            window_size = max(2, L // 4)
-            sst_features = []
+                epoch_loss += loss.item()
+                num_batches += 1
 
-            for i in range(0, L - window_size + 1, window_size // 2):
-                window = trajectories[:, i:i+window_size, :]
-                window_fft = torch.fft.rfft(window, dim=1)
-
-                if i > 0 and i + window_size <= L:
-                    prev_window = trajectories[:, i-1:i-1+window_size, :]
-                    prev_fft = torch.fft.rfft(prev_window, dim=1)
-
-                    phase_curr = torch.angle(window_fft)
-                    phase_prev = torch.angle(prev_fft)
-                    inst_freq = torch.abs(phase_curr - phase_prev)
-
-                    magnitude = torch.abs(window_fft)
-                    sst_feature = (inst_freq * magnitude).sum(dim=1)
-                else:
-                    sst_feature = torch.abs(window_fft).mean(dim=1)
-
-                sst_features.append(sst_feature)
-
-            if sst_features:
-                sst_power = torch.stack(sst_features, dim=1)
-                all_ssts.append(sst_power)
-
-        # Batch update statistics (one call per metric type)
-        if all_wavelets:
-            all_wavelets = torch.cat(all_wavelets, dim=0)
-            all_wavelets_flat = all_wavelets.reshape(all_wavelets.shape[0], -1)
-            self._update_statistics('wavelet', all_wavelets_flat)
-            del all_wavelets, all_wavelets_flat
-
-        if all_stfts:
-            all_stfts = torch.cat(all_stfts, dim=0)
-            all_stfts_flat = all_stfts.reshape(all_stfts.shape[0], -1)
-            self._update_statistics('stft', all_stfts_flat)
-            del all_stfts, all_stfts_flat
-
-        if all_hhts:
-            all_hhts = torch.cat(all_hhts, dim=0)
-            all_hhts_flat = all_hhts.reshape(all_hhts.shape[0], -1)
-            self._update_statistics('hht', all_hhts_flat)
-            del all_hhts, all_hhts_flat
-
-        if all_ssts:
-            all_ssts = torch.cat(all_ssts, dim=0)
-            all_ssts_flat = all_ssts.reshape(all_ssts.shape[0], -1)
-            self._update_statistics('sst', all_ssts_flat)
-            del all_ssts, all_ssts_flat
-
-        # Explicit memory cleanup
-        torch.cuda.empty_cache()
-
-        return self
-
-    def _update_statistics(self, stat_type, batch_data):
-        """
-        Update mean and M2 using batch-wise Welford's algorithm (GPU-optimized)
-
-        Args:
-            stat_type: 'wavelet', 'stft', 'hht', or 'sst'
-            batch_data: [N_batch, D] tensor
-        """
-        N_batch = batch_data.shape[0]
-
-        # Get corresponding mean and M2
-        if stat_type == 'wavelet':
-            mean_attr = 'mean_wavelet'
-            M2_attr = 'M2_wavelet'
-        elif stat_type == 'stft':
-            mean_attr = 'mean_stft'
-            M2_attr = 'M2_stft'
-        elif stat_type == 'hht':
-            mean_attr = 'mean_hht'
-            M2_attr = 'M2_hht'
-        elif stat_type == 'sst':
-            mean_attr = 'mean_sst'
-            M2_attr = 'M2_sst'
-
-        # Initialize if first batch
-        if getattr(self, mean_attr) is None:
-            setattr(self, mean_attr, torch.zeros(batch_data.shape[1], device=self.device))
-            setattr(self, M2_attr, torch.zeros(batch_data.shape[1], device=self.device))
-
-        old_mean = getattr(self, mean_attr)
-        old_M2 = getattr(self, M2_attr)
-        old_n = self.n_samples
-
-        # Batch-wise update (GPU-accelerated)
-        # Compute batch statistics
-        batch_mean = batch_data.mean(dim=0)  # [D]
-        batch_var = batch_data.var(dim=0, unbiased=False)  # [D]
-
-        # Update count
-        new_n = old_n + N_batch
-
-        # Combine means
-        delta = batch_mean - old_mean
-        new_mean = old_mean + delta * (N_batch / new_n)
-
-        # Combine M2 using parallel algorithm
-        new_M2 = old_M2 + batch_var * N_batch + delta ** 2 * (old_n * N_batch / new_n)
-
-        setattr(self, mean_attr, new_mean)
-        setattr(self, M2_attr, new_M2)
-        self.n_samples = new_n
-
-    def finalize(self):
-        """
-        Finalize statistics by computing covariance inverse from accumulated M2
-
-        Call this after all partial_fit calls are complete.
-
-        Returns:
-            self: For method chaining
-        """
-        print(f"  Finalizing statistics from {self.n_samples} samples...")
-
-        # Compute covariance matrices from M2
-        if self.M2_wavelet is not None and self.n_samples > 1:
-            # For single-dimensional covariance, M2/(n-1) gives variance
-            # For multi-dimensional, we need full covariance matrix
-            # Here we use diagonal approximation for efficiency
-            var_wavelet = self.M2_wavelet / (self.n_samples - 1)
-            cov_wavelet = torch.diag(var_wavelet)
-            cov_wavelet += torch.eye(cov_wavelet.shape[0], device=self.device) * 1e-6
-            self.cov_inv_wavelet = torch.linalg.inv(cov_wavelet)
-
-        if self.M2_stft is not None and self.n_samples > 1:
-            var_stft = self.M2_stft / (self.n_samples - 1)
-            cov_stft = torch.diag(var_stft)
-            cov_stft += torch.eye(cov_stft.shape[0], device=self.device) * 1e-6
-            self.cov_inv_stft = torch.linalg.inv(cov_stft)
-
-        if self.M2_hht is not None and self.n_samples > 1:
-            var_hht = self.M2_hht / (self.n_samples - 1)
-            cov_hht = torch.diag(var_hht)
-            cov_hht += torch.eye(cov_hht.shape[0], device=self.device) * 1e-6
-            self.cov_inv_hht = torch.linalg.inv(cov_hht)
-
-        if self.M2_sst is not None and self.n_samples > 1:
-            var_sst = self.M2_sst / (self.n_samples - 1)
-            cov_sst = torch.diag(var_sst)
-            cov_sst += torch.eye(cov_sst.shape[0], device=self.device) * 1e-6
-            self.cov_inv_sst = torch.linalg.inv(cov_sst)
+            avg_loss = epoch_loss / num_batches
+            print(f"    Epoch {epoch+1}/{num_epochs}: Loss = {avg_loss:.6f}")
 
         self.fitted = True
-
-        # Print learned statistics
-        print(f"  ✓ Normal trajectory characteristics learned:")
-        print(f"    Wavelet (Mahalanobis):")
-        if self.mean_wavelet is not None:
-            print(f"      Mean dim:   {self.mean_wavelet.shape[0]}")
-            print(f"      Cov inv:    {self.cov_inv_wavelet.shape}")
-        print(f"    STFT (Mahalanobis):")
-        if self.mean_stft is not None:
-            print(f"      Mean dim:   {self.mean_stft.shape[0]}")
-            print(f"      Cov inv:    {self.cov_inv_stft.shape}")
-        print(f"    HHT/EMD (Mahalanobis):")
-        if self.mean_hht is not None:
-            print(f"      Mean dim:   {self.mean_hht.shape[0]}")
-            print(f"      Cov inv:    {self.cov_inv_hht.shape}")
-        print(f"    SST (Mahalanobis):")
-        if self.mean_sst is not None:
-            print(f"      Mean dim:   {self.mean_sst.shape[0]}")
-            print(f"      Cov inv:    {self.cov_inv_sst.shape}")
+        print(f"  ✓ Model training completed")
 
         return self
 
-    def save(self, cache_path):
+    def save_weights(self, weights_path):
         """
-        Save attractor statistics to disk
+        Save model weights to disk
 
         Args:
-            cache_path: Path to save the attractor cache file
+            weights_path: Path to save the model weights
         """
-        cache_path = Path(cache_path)
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        weights_path = Path(weights_path)
+        weights_path.parent.mkdir(parents=True, exist_ok=True)
 
         state = {
-            'fitted': self.fitted,
-            'n_samples': self.n_samples,
-            'mean_wavelet': self.mean_wavelet,
-            'cov_inv_wavelet': self.cov_inv_wavelet,
-            'mean_stft': self.mean_stft,
-            'cov_inv_stft': self.cov_inv_stft,
-            'mean_hht': self.mean_hht,
-            'cov_inv_hht': self.cov_inv_hht,
-            'mean_sst': self.mean_sst,
-            'cov_inv_sst': self.cov_inv_sst,
-            'M2_wavelet': self.M2_wavelet,
-            'M2_stft': self.M2_stft,
-            'M2_hht': self.M2_hht,
-            'M2_sst': self.M2_sst,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'model_type': self.model_type,
+            'fitted': self.fitted
         }
 
-        torch.save(state, cache_path)
-        print(f"  ✓ Attractor saved to: {cache_path}")
+        torch.save(state, weights_path)
+        print(f"  ✓ Model weights saved to: {weights_path}")
 
-    def load(self, cache_path):
+    def load_weights(self, weights_path):
         """
-        Load attractor statistics from disk
+        Load model weights from disk
 
         Args:
-            cache_path: Path to the attractor cache file
+            weights_path: Path to the model weights file
 
         Returns:
             self: For method chaining
 
         Raises:
-            FileNotFoundError: If cache file doesn't exist
+            FileNotFoundError: If weights file doesn't exist
         """
-        cache_path = Path(cache_path)
-        if not cache_path.exists():
-            raise FileNotFoundError(f"Attractor cache not found: {cache_path}")
+        weights_path = Path(weights_path)
+        if not weights_path.exists():
+            raise FileNotFoundError(f"Model weights not found: {weights_path}")
 
-        state = torch.load(cache_path, map_location=self.device)
+        state = torch.load(weights_path, map_location=self.device)
 
+        self.model.load_state_dict(state['model_state_dict'])
+        self.optimizer.load_state_dict(state['optimizer_state_dict'])
+        self.model_type = state['model_type']
         self.fitted = state['fitted']
-        self.n_samples = state['n_samples']
-        self.mean_wavelet = state['mean_wavelet']
-        self.cov_inv_wavelet = state['cov_inv_wavelet']
-        self.mean_stft = state['mean_stft']
-        self.cov_inv_stft = state['cov_inv_stft']
-        self.mean_hht = state['mean_hht']
-        self.cov_inv_hht = state['cov_inv_hht']
-        self.mean_sst = state['mean_sst']
-        self.cov_inv_sst = state['cov_inv_sst']
-        self.M2_wavelet = state['M2_wavelet']
-        self.M2_stft = state['M2_stft']
-        self.M2_hht = state['M2_hht']
-        self.M2_sst = state['M2_sst']
 
-        print(f"  ✓ Attractor loaded from: {cache_path}")
-        print(f"  ✓ Trained on {self.n_samples} samples")
+        print(f"  ✓ Model weights loaded from: {weights_path}")
 
         return self
 
-    def adapt_to_domain(self, domain_embeddings_gpu):
+    def adapt_with_lora(self, domain_embeddings_gpu, lora_cfg, num_epochs=5, batch_size=32):
         """
-        Adapt ImageNet statistics to domain-specific distribution using statistical alignment
+        Adapt model to domain using LoRA (Low-Rank Adaptation)
 
-        This computes domain statistics and prepares adaptation parameters without neural networks.
-        Uses CORAL-style covariance alignment for domain shift correction.
+        This method freezes the base model and adds trainable LoRA layers
+        for efficient domain adaptation.
 
         Args:
             domain_embeddings_gpu: List of [H, W, L, D] tensors from domain clean images
+            lora_cfg: LoRA configuration (Hydra DictConfig or dict)
+            num_epochs: Number of adaptation epochs
+            batch_size: Batch size for adaptation
 
         Returns:
-            dict: Domain statistics for each metric type
+            self: For method chaining
         """
-        print(f"\n  [Domain Adaptation]")
-        print(f"  Computing domain statistics from {len(domain_embeddings_gpu)} clean images...")
+        print(f"\n  [Phase 2: LoRA Domain Adaptation]")
+        print(f"  Adapting model to domain with {len(domain_embeddings_gpu)} clean images...")
 
-        domain_stats = {}
+        # Extract LoRA config
+        if isinstance(lora_cfg, dict):
+            rank = lora_cfg.get('rank', 8)
+            alpha = lora_cfg.get('alpha', 16)
+            target_modules = lora_cfg.get('target_modules', ['Linear'])
+        else:
+            rank = getattr(lora_cfg, 'rank', 8)
+            alpha = getattr(lora_cfg, 'alpha', 16)
+            target_modules = getattr(lora_cfg, 'target_modules', ['Linear'])
 
-        # Collect domain statistics (same feature extraction as ImageNet)
-        all_wavelets = []
-        all_stfts = []
-        all_hhts = []
-        all_ssts = []
+        print(f"    LoRA rank: {rank}")
+        print(f"    LoRA alpha: {alpha}")
+        print(f"    Target modules: {target_modules}")
 
+        # Apply LoRA to model
+        self.model, lora_params = apply_lora_to_model(
+            self.model, rank, alpha, target_modules
+        )
+
+        # Create optimizer for LoRA parameters only
+        if isinstance(lora_cfg, dict):
+            lr = lora_cfg.get('learning_rate', 0.0001)
+            weight_decay = lora_cfg.get('weight_decay', 0.0001)
+        else:
+            # Access from parent domain_adaptation config
+            lr = 0.0001
+            weight_decay = 0.0001
+
+        lora_optimizer = torch.optim.Adam(
+            lora_params,
+            lr=lr,
+            weight_decay=weight_decay
+        )
+
+        print(f"    LoRA learning rate: {lr}")
+        print(f"    Epochs: {num_epochs}, Batch size: {batch_size}")
+
+        # Prepare domain data
+        all_trajectories = []
         for emb in domain_embeddings_gpu:
             H, W, L, D = emb.shape
             trajectories = emb.reshape(-1, L, D)
+            all_trajectories.append(trajectories)
 
-            # Extract same features as ImageNet
-            if L >= 2:
-                half_L = L // 2
-                detail = (trajectories[:, :half_L*2:2, :] - trajectories[:, 1:half_L*2:2, :]) / 2
-                wavelet_coeff = torch.abs(detail)
-                all_wavelets.append(wavelet_coeff)
+        domain_data = torch.cat(all_trajectories, dim=0)
+        print(f"    Total domain trajectories: {domain_data.shape[0]}")
 
-            window_size = max(2, L // 4)
-            stft_powers = []
-            for i in range(0, L - window_size + 1, window_size // 2):
-                window = trajectories[:, i:i+window_size, :]
-                window_fft = torch.fft.rfft(window, dim=1)
-                window_power = torch.abs(window_fft) ** 2
-                log_window_power = torch.log10(window_power + 1e-10)
-                stft_powers.append(log_window_power.mean(dim=1))
-            if stft_powers:
-                stft_power = torch.stack(stft_powers, dim=1)
-                all_stfts.append(stft_power)
+        # LoRA training loop
+        self.model.train()
+        for epoch in range(num_epochs):
+            epoch_loss = 0.0
+            num_batches = 0
 
-            residual = trajectories
-            imfs = []
-            for _ in range(min(3, L // 2)):
-                if L >= 3:
-                    padded = torch.nn.functional.pad(residual, (0, 0, 1, 1), mode='replicate')
-                    local_mean = (padded[:, :-2, :] + padded[:, 1:-1, :] + padded[:, 2:, :]) / 3.0
-                    imf = residual - local_mean
-                    imfs.append(torch.abs(imf).mean(dim=1))
-                    residual = local_mean
+            # Shuffle data
+            perm = torch.randperm(domain_data.shape[0], device=self.device)
+            shuffled_data = domain_data[perm]
+
+            # Mini-batch training
+            for i in range(0, domain_data.shape[0], batch_size):
+                batch = shuffled_data[i:i+batch_size]
+
+                # Forward pass
+                lora_optimizer.zero_grad()
+
+                if self.model_type == 'vae':
+                    reconstruction, mu, logvar = self.model(batch)
+                    recon_loss = nn.functional.mse_loss(reconstruction, batch)
+                    kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+                    loss = recon_loss + 0.001 * kl_loss
                 else:
-                    break
-            if imfs:
-                hht_features = torch.stack(imfs, dim=1)
-                all_hhts.append(hht_features)
+                    reconstruction, _ = self.model(batch)
+                    loss = nn.functional.mse_loss(reconstruction, batch)
 
-            window_size = max(2, L // 4)
-            sst_features = []
-            for i in range(0, L - window_size + 1, window_size // 2):
-                window = trajectories[:, i:i+window_size, :]
-                window_fft = torch.fft.rfft(window, dim=1)
-                if i > 0 and i + window_size <= L:
-                    prev_window = trajectories[:, i-1:i-1+window_size, :]
-                    prev_fft = torch.fft.rfft(prev_window, dim=1)
-                    phase_curr = torch.angle(window_fft)
-                    phase_prev = torch.angle(prev_fft)
-                    inst_freq = torch.abs(phase_curr - phase_prev)
-                    magnitude = torch.abs(window_fft)
-                    sst_feature = (inst_freq * magnitude).sum(dim=1)
-                else:
-                    sst_feature = torch.abs(window_fft).mean(dim=1)
-                sst_features.append(sst_feature)
-            if sst_features:
-                sst_power = torch.stack(sst_features, dim=1)
-                all_ssts.append(sst_power)
+                # Backward pass (only LoRA parameters updated)
+                loss.backward()
+                lora_optimizer.step()
 
-        # Compute domain statistics
-        def compute_stats(data_list, name):
-            if not data_list:
-                return None
-            data = torch.cat(data_list, dim=0)
-            data_flat = data.reshape(data.shape[0], -1)
+                epoch_loss += loss.item()
+                num_batches += 1
 
-            mean_domain = data_flat.mean(dim=0)
-            centered = data_flat - mean_domain
-            cov_domain = (centered.T @ centered) / (data_flat.shape[0] - 1)
-            cov_domain += torch.eye(cov_domain.shape[0], device=self.device) * 1e-6
+            avg_loss = epoch_loss / num_batches
+            print(f"    Epoch {epoch+1}/{num_epochs}: Loss = {avg_loss:.6f}")
 
-            print(f"    {name}: domain mean shape {mean_domain.shape}")
-            return {
-                'mean': mean_domain,
-                'cov': cov_domain
-            }
+        print(f"  ✓ LoRA domain adaptation completed")
 
-        domain_stats['wavelet'] = compute_stats(all_wavelets, 'Wavelet')
-        domain_stats['stft'] = compute_stats(all_stfts, 'STFT')
-        domain_stats['hht'] = compute_stats(all_hhts, 'HHT/EMD')
-        domain_stats['sst'] = compute_stats(all_ssts, 'SST')
+        return self
 
-        print(f"  ✓ Domain adaptation complete")
-
-        return domain_stats
-
-    @staticmethod
-    def get_cache_filename(imagenet_path, num_samples, spatial_resolution, feature_dim):
+    def save_lora_weights(self, lora_weights_path):
         """
-        Generate a unique cache filename based on configuration
+        Save only LoRA adaptation weights
 
         Args:
+            lora_weights_path: Path to save LoRA weights
+        """
+        lora_weights_path = Path(lora_weights_path)
+        lora_weights_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Extract LoRA parameters
+        lora_state = {}
+        for name, module in self.model.named_modules():
+            if hasattr(module, 'lora'):
+                lora_state[name] = module.lora.state_dict()
+
+        torch.save(lora_state, lora_weights_path)
+        print(f"  ✓ LoRA weights saved to: {lora_weights_path}")
+
+    def load_lora_weights(self, lora_weights_path):
+        """
+        Load LoRA adaptation weights
+
+        Args:
+            lora_weights_path: Path to LoRA weights file
+
+        Returns:
+            self: For method chaining
+
+        Raises:
+            FileNotFoundError: If LoRA weights file doesn't exist
+        """
+        lora_weights_path = Path(lora_weights_path)
+        if not lora_weights_path.exists():
+            raise FileNotFoundError(f"LoRA weights not found: {lora_weights_path}")
+
+        lora_state = torch.load(lora_weights_path, map_location=self.device)
+
+        # Load LoRA parameters
+        for name, module in self.model.named_modules():
+            if hasattr(module, 'lora') and name in lora_state:
+                module.lora.load_state_dict(lora_state[name])
+
+        print(f"  ✓ LoRA weights loaded from: {lora_weights_path}")
+
+        return self
+
+    @staticmethod
+    def get_weights_filename(model_type, imagenet_path, num_samples, spatial_resolution,
+                           feature_dim, hidden_dim, latent_dim, num_layers):
+        """
+        Generate a unique weights filename based on configuration
+
+        Args:
+            model_type: Model type ('autoencoder', 'vae', 'transformer')
             imagenet_path: Path to ImageNet dataset
             num_samples: Number of samples used for training
             spatial_resolution: Spatial resolution of features
             feature_dim: Feature dimension
+            hidden_dim: Hidden dimension
+            latent_dim: Latent dimension
+            num_layers: Number of layers
 
         Returns:
-            str: Cache filename
+            str: Weights filename
         """
         # Create a hash of the configuration
-        config_str = f"{imagenet_path}_{num_samples}_{spatial_resolution}_{feature_dim}"
+        config_str = (f"{imagenet_path}_{num_samples}_{spatial_resolution}_{feature_dim}_"
+                     f"{hidden_dim}_{latent_dim}_{num_layers}")
         config_hash = hashlib.md5(config_str.encode()).hexdigest()[:8]
 
-        return f"attractor_s{num_samples}_r{spatial_resolution}_d{feature_dim}_{config_hash}.pt"
+        return f"{model_type}_s{num_samples}_r{spatial_resolution}_d{feature_dim}_{config_hash}.pt"
+
+    @staticmethod
+    def get_lora_weights_filename(model_type, domain_path, num_samples, rank, alpha):
+        """
+        Generate a unique LoRA weights filename
+
+        Args:
+            model_type: Model type
+            domain_path: Path to domain dataset
+            num_samples: Number of domain samples
+            rank: LoRA rank
+            alpha: LoRA alpha
+
+        Returns:
+            str: LoRA weights filename
+        """
+        config_str = f"{model_type}_{domain_path}_{num_samples}_{rank}_{alpha}"
+        config_hash = hashlib.md5(config_str.encode()).hexdigest()[:8]
+
+        return f"lora_{model_type}_r{rank}_a{alpha}_{config_hash}.pt"
