@@ -1,6 +1,10 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models.resnet import Bottleneck
+from torchvision.models.resnet import Bottleneck, BasicBlock
+from torchvision.models.convnext import CNBlock
+from torchvision.models.mobilenetv3 import InvertedResidual
+from torchvision.models.efficientnet import MBConv, FusedMBConv
 
 
 def _validate_depth_scaling(depth_scaling):
@@ -17,7 +21,10 @@ def _validate_depth_scaling(depth_scaling):
 
 
 class ActivationExtractor:
-    """ResNet의 multi-layer activation을 추출 (GPU)"""
+    """
+    Multi-layer activation extractor for various CNN architectures (GPU).
+    Supports: ResNet, ConvNeXt, MobileNetV3, EfficientNet, ViT
+    """
 
     def __init__(
         self,
@@ -41,13 +48,33 @@ class ActivationExtractor:
         # Ensure BN/Dropout stay frozen
         self.model.eval()
 
+        # Define block types to hook based on architecture
+        # ResNet: Bottleneck (ResNet50+) or BasicBlock (ResNet18/34)
+        # ConvNeXt: CNBlock
+        # MobileNetV3: InvertedResidual
+        # EfficientNet: MBConv, FusedMBConv
+        target_blocks = (Bottleneck, BasicBlock, CNBlock, InvertedResidual, MBConv, FusedMBConv)
+
         self.layer_names = []
         for name, module in model.named_modules():
-            if isinstance(module, Bottleneck):
+            if isinstance(module, target_blocks):
                 layer_idx = len(self.layer_names)
                 hook = module.register_forward_hook(self._get_activation(name, layer_idx))
                 self.hooks.append(hook)
                 self.layer_names.append(name)
+
+        # For Vision Transformer, hook attention blocks
+        if hasattr(model, 'encoder') and 'vit' in model.__class__.__name__.lower():
+            for name, module in model.encoder.named_modules():
+                if 'EncoderBlock' in module.__class__.__name__:
+                    layer_idx = len(self.layer_names)
+                    hook = module.register_forward_hook(self._get_activation(f"encoder.{name}", layer_idx))
+                    self.hooks.append(hook)
+                    self.layer_names.append(f"encoder.{name}")
+
+        if len(self.layer_names) == 0:
+            print(f"⚠ Warning: No target blocks found in model {model.__class__.__name__}")
+            print(f"  Supported blocks: {[b.__name__ for b in target_blocks]}")
 
         self._init_depth_scalars()
 

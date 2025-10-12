@@ -36,9 +36,17 @@ data:
 
 # Model configuration
 model:
+  # Backbone architecture for feature extraction
+  # Options: resnet18, resnet34, resnet50, resnet101, resnet152,
+  #          convnext_tiny, convnext_small, convnext_base,
+  #          mobilenet_v3_small, mobilenet_v3_large,
+  #          efficientnet_b0, efficientnet_b4,
+  #          vit_b_16 (Vision Transformer)
+  backbone: convnext_tiny  # Default: ResNet-50
+
   # Feature extraction settings
   spatial_resolution: 14  # Spatial resolution for feature extraction (7, 14, 28, 56)
-  feature_dim: 256  # Feature dimension after channel pooling
+  feature_dim: 96  # Feature dimension after channel pooling
 
   # Trajectory processing options
   trajectory:

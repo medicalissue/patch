@@ -36,6 +36,63 @@ from visualize import visualize_results
 from grid_metrics import compute_ground_truth_grid, compute_grid_metrics
 
 
+def load_backbone_model(backbone_name, pretrained=True):
+    """
+    Load backbone model for feature extraction
+
+    Args:
+        backbone_name: Name of the backbone (e.g., 'resnet50', 'convnext_tiny')
+        pretrained: Whether to load pretrained weights
+
+    Returns:
+        model: Loaded backbone model
+    """
+    backbone_name = backbone_name.lower()
+
+    # ResNet family
+    if backbone_name == 'resnet18':
+        model = models.resnet18(weights='IMAGENET1K_V1' if pretrained else None)
+    elif backbone_name == 'resnet34':
+        model = models.resnet34(weights='IMAGENET1K_V1' if pretrained else None)
+    elif backbone_name == 'resnet50':
+        model = models.resnet50(weights='IMAGENET1K_V2' if pretrained else None)
+    elif backbone_name == 'resnet101':
+        model = models.resnet101(weights='IMAGENET1K_V2' if pretrained else None)
+    elif backbone_name == 'resnet152':
+        model = models.resnet152(weights='IMAGENET1K_V2' if pretrained else None)
+
+    # ConvNeXt family
+    elif backbone_name == 'convnext_tiny':
+        model = models.convnext_tiny(weights='IMAGENET1K_V1' if pretrained else None)
+    elif backbone_name == 'convnext_small':
+        model = models.convnext_small(weights='IMAGENET1K_V1' if pretrained else None)
+    elif backbone_name == 'convnext_base':
+        model = models.convnext_base(weights='IMAGENET1K_V1' if pretrained else None)
+
+    # MobileNet V3 family
+    elif backbone_name == 'mobilenet_v3_small':
+        model = models.mobilenet_v3_small(weights='IMAGENET1K_V1' if pretrained else None)
+    elif backbone_name == 'mobilenet_v3_large':
+        model = models.mobilenet_v3_large(weights='IMAGENET1K_V2' if pretrained else None)
+
+    # EfficientNet family
+    elif backbone_name == 'efficientnet_b0':
+        model = models.efficientnet_b0(weights='IMAGENET1K_V1' if pretrained else None)
+    elif backbone_name == 'efficientnet_b4':
+        model = models.efficientnet_b4(weights='IMAGENET1K_V1' if pretrained else None)
+
+    # Vision Transformer
+    elif backbone_name == 'vit_b_16':
+        model = models.vit_b_16(weights='IMAGENET1K_V1' if pretrained else None)
+
+    else:
+        raise ValueError(f"Unsupported backbone: {backbone_name}. "
+                        f"Supported: resnet18/34/50/101/152, convnext_tiny/small/base, "
+                        f"mobilenet_v3_small/large, efficientnet_b0/b4, vit_b_16")
+
+    return model
+
+
 class Conv2dWithReflectionPadding(nn.Module):
     """
     Wraps a Conv2d to apply reflection padding instead of zero padding.
@@ -268,14 +325,19 @@ def main(cfg: DictConfig):
     print(f"Device: {device}")
     print(f"Workers: {cfg.device.num_workers}")
 
-    # Load ResNet50 model
-    print("\nLoading ResNet50 model...")
-    model = models.resnet50(pretrained=True)
-    convert_conv_layers_to_reflection(model)
-    print("✓ Converted ResNet convolutions to reflection padding")
-    model.eval()
-    model.to(device)
-    print("✓ Model loaded successfully")
+    # Load backbone model
+    backbone_name = getattr(cfg.model, 'backbone', 'resnet50')
+    print(f"\nLoading backbone model: {backbone_name}...")
+    try:
+        model = load_backbone_model(backbone_name, pretrained=True)
+        convert_conv_layers_to_reflection(model)
+        print("✓ Converted convolutions to reflection padding")
+        model.eval()
+        model.to(device)
+        print(f"✓ Model loaded successfully: {backbone_name}")
+    except ValueError as e:
+        print(f"\n✗ Error loading backbone: {e}")
+        return
 
     # Setup activation extractor
     print(f"\nSetting up activation extractor...")
@@ -375,18 +437,23 @@ def main(cfg: DictConfig):
     save_weights = cfg.model.phase1.save_weights
     weights_dir = Path(cfg.model.phase1.weights_dir)
 
-    # Generate weights filename
-    weights_filename = ModelTrainer.get_weights_filename(
-        cfg.model.type,
-        cfg.data.imagenet.path,
-        cfg.data.imagenet.num_samples,
-        cfg.model.spatial_resolution,
-        cfg.model.feature_dim,
-        cfg.model.hidden_dim,
-        cfg.model.latent_dim,
-        cfg.model.num_layers
+    # Generate weights directory structure: model_weights/{backbone}/{model_config}/
+    backbone_name = getattr(cfg.model, 'backbone', 'resnet50')
+    model_config_str = (
+        f"{cfg.model.type}_"
+        f"res{cfg.model.spatial_resolution}_"
+        f"feat{cfg.model.feature_dim}_"
+        f"hid{cfg.model.hidden_dim}_"
+        f"lat{cfg.model.latent_dim}_"
+        f"L{cfg.model.num_layers}"
     )
-    weights_path = weights_dir / weights_filename
+
+    weights_subdir = weights_dir / backbone_name / model_config_str
+    weights_subdir.mkdir(parents=True, exist_ok=True)
+    weights_path = weights_subdir / "model.pt"
+
+    print(f"  Weights directory: {weights_subdir}")
+    print(f"  Backbone: {backbone_name}")
 
     # Try to load saved weights
     model_loaded = False
@@ -509,15 +576,19 @@ def main(cfg: DictConfig):
                 save_lora = cfg.domain_adaptation.phase2.save_weights
                 lora_weights_dir = Path(cfg.domain_adaptation.phase2.weights_dir)
 
-                # Generate LoRA weights filename
-                lora_weights_filename = ModelTrainer.get_lora_weights_filename(
-                    cfg.model.type,
-                    cfg.data.domain.clean_path,
-                    cfg.data.domain.num_samples,
-                    cfg.domain_adaptation.lora.rank,
-                    cfg.domain_adaptation.lora.alpha
+                # Generate LoRA weights directory structure: lora_weights/{backbone}/{model_config}/
+                lora_config_str = (
+                    f"{cfg.model.type}_"
+                    f"rank{cfg.domain_adaptation.lora.rank}_"
+                    f"alpha{cfg.domain_adaptation.lora.alpha}"
                 )
-                lora_weights_path = lora_weights_dir / lora_weights_filename
+
+                lora_weights_subdir = lora_weights_dir / backbone_name / model_config_str / lora_config_str
+                lora_weights_subdir.mkdir(parents=True, exist_ok=True)
+                lora_weights_path = lora_weights_subdir / "lora.pt"
+
+                print(f"  LoRA weights directory: {lora_weights_subdir}")
+                print(f"  Backbone: {backbone_name}")
 
                 # Try to load saved LoRA weights
                 lora_loaded = False
