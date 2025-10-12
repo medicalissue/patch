@@ -33,6 +33,7 @@ from detector import PatchDetector
 from extracter import ActivationExtractor
 from trajectory import stack_trajectory
 from visualize import visualize_results
+from grid_metrics import compute_ground_truth_grid, compute_grid_metrics
 
 
 class Conv2dWithReflectionPadding(nn.Module):
@@ -263,13 +264,47 @@ def main(cfg: DictConfig):
     )
     print("✓ Extractor initialized")
 
-    # Image preprocessing
-    transform = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
+    # Image preprocessing - MUST match patchgen.py exactly!
+    # If images are already 224x224 (from patchgen.py), we need different preprocessing
+    # Check if we're loading pre-processed images
+    test_path = Path(cfg.data.test.patch_path)
+
+    # Determine if images are already 224x224 (from patchgen.py)
+    # Check metadata for image size info
+    metadata_path_for_check = None
+    if hasattr(cfg, 'evaluation') and hasattr(cfg.evaluation, 'patch_metadata_path'):
+        metadata_path_for_check = Path(cfg.evaluation.patch_metadata_path)
+        if not metadata_path_for_check.is_absolute():
+            metadata_path_for_check = test_path / "patch_metadata.json"
+
+    images_are_preprocessed = False
+    if metadata_path_for_check and metadata_path_for_check.exists():
+        try:
+            with open(metadata_path_for_check) as f_check:
+                meta_check = json.load(f_check)
+                # If patch_shape exists in config, images are from patchgen.py
+                if 'config' in meta_check and 'patch_shape' in meta_check['config']:
+                    images_are_preprocessed = True
+                    print(f"✓ Detected preprocessed images from patchgen.py")
+        except:
+            pass
+
+    if images_are_preprocessed:
+        # Images are already 224x224 from patchgen.py - no resize/crop needed!
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        print(f"  Using direct transform (images already 224x224)")
+    else:
+        # Images are raw - apply full preprocessing like patchgen.py
+        transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        print(f"  Using full preprocessing (Resize→Crop→Normalize)")
 
     # =========================================================================
     # PHASE 1: MODEL TRAINING
@@ -584,6 +619,13 @@ def main(cfg: DictConfig):
         eval_images_false_alarm = 0
         gt_mask_cache = {}
 
+        # Grid-level metrics accumulation
+        grid_tp_total = 0
+        grid_tn_total = 0
+        grid_fp_total = 0
+        grid_fn_total = 0
+        grid_images_evaluated = 0
+
         if patch_eval_enabled:
             metadata_path_value = _eval_cfg_get('patch_metadata_path', '')
             metadata_path = Path(metadata_path_value)
@@ -699,12 +741,49 @@ def main(cfg: DictConfig):
                 if cfg.output.save_visualizations:
                     if not batch_visualized:
                         threshold_method_name = str(cfg.detection.threshold_method)
-                        if threshold_method_name == "mean_std":
-                            threshold_formula = f"Threshold = mean + {cfg.detection.threshold_multiplier}*std"
-                        elif threshold_method_name == "median_mad":
-                            threshold_formula = f"Threshold = median + {cfg.detection.mad_multiplier}*MAD"
-                        else:
-                            threshold_formula = f"Threshold = top {cfg.detection.percentile}% percentile"
+
+                        # Get patch corners from metadata if available
+                        patch_corners_for_viz = None
+                        gt_grid_for_viz = None
+                        grid_metrics_for_viz = None
+
+                        if patch_metadata_map:
+                            for key in (img_name, Path(img_name).name):
+                                if key in patch_metadata_map:
+                                    polygons = patch_metadata_map[key]
+                                    if polygons and len(polygons) > 0:
+                                        # Use first polygon as patch corners
+                                        corners = polygons[0]
+                                        if len(corners) >= 4:
+                                            patch_corners_for_viz = [
+                                                {'x': corners[0][0], 'y': corners[0][1]},
+                                                {'x': corners[1][0], 'y': corners[1][1]},
+                                                {'x': corners[2][0], 'y': corners[2][1]},
+                                                {'x': corners[3][0], 'y': corners[3][1]}
+                                            ]
+
+                                            # Compute ground truth grid
+                                            gt_grid_for_viz = compute_ground_truth_grid(
+                                                patch_corners_for_viz,
+                                                cfg.model.spatial_resolution,
+                                                image_size=224
+                                            )
+                                    break
+
+                        # Compute predicted grid from patch_mask (convert tensor to numpy first)
+                        patch_mask_np = patch_mask.cpu().numpy() if torch.is_tensor(patch_mask) else patch_mask
+                        pred_grid_for_viz = (patch_mask_np > 0).astype(bool)
+
+                        # Compute grid metrics if we have GT
+                        if gt_grid_for_viz is not None:
+                            grid_metrics_for_viz = compute_grid_metrics(gt_grid_for_viz, pred_grid_for_viz)
+
+                            # Accumulate grid metrics
+                            grid_tp_total += grid_metrics_for_viz['tp']
+                            grid_tn_total += grid_metrics_for_viz['tn']
+                            grid_fp_total += grid_metrics_for_viz['fp']
+                            grid_fn_total += grid_metrics_for_viz['fn']
+                            grid_images_evaluated += 1
 
                         fig = visualize_results(
                             img,
@@ -714,9 +793,12 @@ def main(cfg: DictConfig):
                             threshold=threshold,
                             detection_pixel_threshold=cfg.detection.detection_pixel_threshold,
                             threshold_method=threshold_method_name,
-                            threshold_formula=threshold_formula,
                             model_type=cfg.model.type,
-                            trajectories=embeddings_batch[b]
+                            trajectories=embeddings_batch[b],
+                            gt_grid=gt_grid_for_viz,
+                            pred_grid=pred_grid_for_viz,
+                            spatial_resolution=cfg.model.spatial_resolution,
+                            grid_metrics=grid_metrics_for_viz
                         )
 
                         viz_filename = f"batch{batch_idx:04d}_{Path(img_name).stem}.png"
@@ -771,6 +853,27 @@ def main(cfg: DictConfig):
             print(f"    Detected (overlap >0):   {eval_images_detected}")
             print(f"    Missed patches:          {eval_images_missed}")
             print(f"  False-alarm images:        {eval_images_false_alarm}")
+
+        # Grid-level metrics
+        if grid_images_evaluated > 0:
+            grid_total_cells = grid_tp_total + grid_tn_total + grid_fp_total + grid_fn_total
+            grid_accuracy = (grid_tp_total + grid_tn_total) / grid_total_cells if grid_total_cells > 0 else 0.0
+            grid_precision = grid_tp_total / (grid_tp_total + grid_fp_total) if (grid_tp_total + grid_fp_total) > 0 else 0.0
+            grid_recall = grid_tp_total / (grid_tp_total + grid_fn_total) if (grid_tp_total + grid_fn_total) > 0 else 0.0
+            grid_f1 = (2 * grid_precision * grid_recall / (grid_precision + grid_recall)) if (grid_precision + grid_recall) > 0 else 0.0
+
+            print(f"\nGrid-Level Metrics ({cfg.model.spatial_resolution}×{cfg.model.spatial_resolution} cells):")
+            print(f"  Evaluated images:          {grid_images_evaluated}")
+            print(f"  Total cells:               {grid_total_cells}")
+            print(f"  Confusion Matrix:")
+            print(f"    TP: {grid_tp_total:6d}  |  FP: {grid_fp_total:6d}")
+            print(f"    FN: {grid_fn_total:6d}  |  TN: {grid_tn_total:6d}")
+            print(f"  Performance Metrics:")
+            print(f"    Accuracy:                {grid_accuracy * 100:.2f}%")
+            print(f"    Precision:               {grid_precision * 100:.2f}%")
+            print(f"    Recall:                  {grid_recall * 100:.2f}%")
+            print(f"    F1 Score:                {grid_f1 * 100:.2f}%")
+
         if missing_metadata:
             missing_list = sorted(list(missing_metadata))
             preview = ', '.join(missing_list[:5])

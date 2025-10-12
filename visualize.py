@@ -86,8 +86,9 @@ def _build_component_colors(num_labels):
 
 def visualize_results(image, anomaly_map_gpu, patch_mask_gpu,
                      image_name="", threshold=0.0, detection_pixel_threshold=0,
-                     threshold_method="percentile", threshold_formula="",
-                     model_type="autoencoder", trajectories=None):
+                     threshold_method="percentile",
+                     model_type="autoencoder", trajectories=None,
+                     gt_grid=None, pred_grid=None, spatial_resolution=14, grid_metrics=None):
     """
     Visualize model-based detection results with reconstruction error
 
@@ -122,8 +123,8 @@ def visualize_results(image, anomaly_map_gpu, patch_mask_gpu,
     anomaly_map = anomaly_map_gpu.cpu().numpy()
     patch_mask = patch_mask_gpu.cpu().numpy()
 
-    fig = plt.figure(figsize=(18, 12))
-    gs = fig.add_gridspec(3, 3, hspace=0.35, wspace=0.35, height_ratios=[1.0, 1.0, 0.8])
+    fig = plt.figure(figsize=(20, 14))
+    gs = fig.add_gridspec(4, 3, hspace=0.4, wspace=0.3, height_ratios=[1.0, 1.0, 1.0, 0.5])
 
     img_display = denormalize_image(image)
 
@@ -275,14 +276,80 @@ def visualize_results(image, anomaly_map_gpu, patch_mask_gpu,
             ax7.text(0.5, 0.5, "t-SNE requires at least 3 trajectories",
                      ha='center', va='center', fontsize=10)
 
-    # Row 3: Metrics panel spanning entire row
-    ax_metrics = fig.add_subplot(gs[2, :])
-    ax_metrics.axis('off')
+    # Row 3: Grid visualization
+    if gt_grid is not None and pred_grid is not None:
+        # GT Grid
+        ax8 = fig.add_subplot(gs[2, 0])
+        ax8.imshow(img_display)
+        cell_h = img_display.shape[0] / spatial_resolution
+        cell_w = img_display.shape[1] / spatial_resolution
 
+        for i in range(spatial_resolution):
+            for j in range(spatial_resolution):
+                if gt_grid[i, j]:
+                    rect = plt.Rectangle((j * cell_w, i * cell_h), cell_w, cell_h,
+                                        fill=True, facecolor='lime', edgecolor='green',
+                                        linewidth=1.5, alpha=0.4)
+                    ax8.add_patch(rect)
+
+        gt_count = int(gt_grid.sum())
+        ax8.set_title(f'Ground Truth Grid\n{gt_count} cells ({spatial_resolution}×{spatial_resolution})',
+                     fontsize=11, fontweight='bold')
+        ax8.axis('off')
+
+        # Predicted Grid
+        ax9 = fig.add_subplot(gs[2, 1])
+        ax9.imshow(img_display)
+
+        for i in range(spatial_resolution):
+            for j in range(spatial_resolution):
+                if pred_grid[i, j]:
+                    rect = plt.Rectangle((j * cell_w, i * cell_h), cell_w, cell_h,
+                                        fill=True, facecolor='orange', edgecolor='red',
+                                        linewidth=1.5, alpha=0.4)
+                    ax9.add_patch(rect)
+
+        pred_count = int(pred_grid.sum())
+        ax9.set_title(f'Predicted Grid\n{pred_count} cells ({spatial_resolution}×{spatial_resolution})',
+                     fontsize=11, fontweight='bold')
+        ax9.axis('off')
+
+        # Grid Comparison (TP/FP/FN)
+        ax10 = fig.add_subplot(gs[2, 2])
+        ax10.imshow(img_display, alpha=0.3)
+
+        for i in range(spatial_resolution):
+            for j in range(spatial_resolution):
+                gt_val = gt_grid[i, j]
+                pred_val = pred_grid[i, j]
+
+                if gt_val and pred_val:
+                    # True Positive - Green
+                    color = 'lime'
+                elif not gt_val and pred_val:
+                    # False Positive - Red
+                    color = 'red'
+                elif gt_val and not pred_val:
+                    # False Negative - Orange
+                    color = 'orange'
+                else:
+                    # True Negative - skip
+                    continue
+
+                rect = plt.Rectangle((j * cell_w, i * cell_h), cell_w, cell_h,
+                                    fill=True, facecolor=color, edgecolor='black',
+                                    linewidth=1, alpha=0.6)
+                ax10.add_patch(rect)
+
+        ax10.set_title(f'Grid Comparison\nTP(green) FP(red) FN(orange)',
+                      fontsize=11, fontweight='bold')
+        ax10.axis('off')
+
+    # Row 4: Metrics panel - split into 3 columns
     spatial_res = f"{anomaly_map.shape[0]}×{anomaly_map.shape[1]}"
 
     if detected_pixels > detection_pixel_threshold:
-        status = "🔴 ANOMALY DETECTED"
+        status = "🔴 DETECTED"
         status_color = 'red'
         bg_color = 'mistyrose'
     else:
@@ -299,50 +366,75 @@ def visualize_results(image, anomaly_map_gpu, patch_mask_gpu,
         'transformer': 'Transformer (Attention)'
     }.get(model_type.lower(), model_type)
 
-    metrics_text = f"""
-━━━━━━━━━━━━━━━━━━━━━━━━━
-MODEL-BASED DETECTION
-━━━━━━━━━━━━━━━━━━━━━━━━━
-
+    # Column 1: Model Info
+    ax_col1 = fig.add_subplot(gs[3, 0])
+    ax_col1.axis('off')
+    col1_text = f"""MODEL INFO
 Model: {model_display}
+Method: Reconstruction Error
+Resolution: {spatial_res}
+Threshold: {threshold_method}
+Value: {threshold:.4f}"""
+    ax_col1.text(0.5, 0.5, col1_text,
+                fontsize=9,
+                verticalalignment='center',
+                horizontalalignment='center',
+                fontfamily='monospace',
+                bbox=dict(boxstyle='round,pad=0.8',
+                          facecolor='lightblue',
+                          alpha=0.8,
+                          edgecolor='steelblue',
+                          linewidth=2))
 
-Detection Method:
-  Reconstruction Error
+    # Column 2: Detection Results
+    ax_col2 = fig.add_subplot(gs[3, 1])
+    ax_col2.axis('off')
+    col2_text = f"""DETECTION
+Status: {status}
+Pixels: {detected_pixels}/{patch_mask.size}
+Rate: {detection_rate:.2f}%
+Max Score: {anomaly_map.max():.4f}
+Mean: {anomaly_map.mean():.4f}"""
+    ax_col2.text(0.5, 0.5, col2_text,
+                fontsize=9,
+                verticalalignment='center',
+                horizontalalignment='center',
+                fontfamily='monospace',
+                bbox=dict(boxstyle='round,pad=0.8',
+                          facecolor=bg_color,
+                          alpha=0.9,
+                          edgecolor=status_color,
+                          linewidth=2))
 
-Spatial Resolution:
-  {spatial_res}
+    # Column 3: Grid Metrics
+    ax_col3 = fig.add_subplot(gs[3, 2])
+    ax_col3.axis('off')
+    if grid_metrics is not None:
+        col3_text = f"""GRID METRICS ({spatial_resolution}×{spatial_resolution})
+TP:{grid_metrics['tp']:4d} FP:{grid_metrics['fp']:4d}
+FN:{grid_metrics['fn']:4d} TN:{grid_metrics['tn']:4d}
+Acc: {grid_metrics['accuracy']*100:.1f}%
+Prec: {grid_metrics['precision']*100:.1f}%
+Rec: {grid_metrics['recall']*100:.1f}%
+F1: {grid_metrics['f1']*100:.1f}%"""
+        grid_bg_color = 'lightyellow'
+        grid_edge_color = 'orange'
+    else:
+        col3_text = """GRID METRICS
+No ground truth
+available"""
+        grid_bg_color = 'lightgray'
+        grid_edge_color = 'gray'
 
-Threshold Method:
-  {threshold_method}
-
-Threshold Formula:
-  {threshold_formula}
-
-Threshold Value:
-  {threshold:.4f}
-
-Score Statistics:
-  Max:  {anomaly_map.max():.4f}
-  Mean: {anomaly_map.mean():.4f}
-  Std:  {anomaly_map.std():.4f}
-
-Detection Results:
-  Pixels: {detected_pixels} / {patch_mask.size}
-  Rate:   {detection_rate:.2f}%
-  Status: {status}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━
-    """
-
-    ax_metrics.text(0.5, 0.5, metrics_text,
-                    fontsize=10,
-                    verticalalignment='center',
-                    horizontalalignment='center',
-                    fontfamily='monospace',
-                    bbox=dict(boxstyle='round,pad=1.2',
-                              facecolor=bg_color,
-                              alpha=0.9,
-                              edgecolor=status_color,
-                              linewidth=3))
+    ax_col3.text(0.5, 0.5, col3_text,
+                fontsize=9,
+                verticalalignment='center',
+                horizontalalignment='center',
+                fontfamily='monospace',
+                bbox=dict(boxstyle='round,pad=0.8',
+                          facecolor=grid_bg_color,
+                          alpha=0.8,
+                          edgecolor=grid_edge_color,
+                          linewidth=2))
 
     return fig
