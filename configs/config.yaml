@@ -17,20 +17,21 @@ data:
   # Phase 1: ImageNet data for model training (clean images only)
   imagenet:
     path: /data/ImageNet/train  # Path to ImageNet training data
-    num_samples: -1  # Number of samples to use for training (-1 for all)
+    num_samples: 1  # Number of samples to use for training (-1 for all)
     batch_size: 512  # Batch size for training
     num_epochs: 1  # Number of training epochs
 
   # Phase 2: Domain-specific clean images for optional LoRA adaptation
   domain:
     clean_path: /data/coco/train2017  # Path to clean images of target domain
-    num_samples: -1  # Number of clean samples (-1 for all available)
+    num_samples: 1  # Number of clean samples (-1 for all available)
     batch_size: 512  # Batch size for adaptation
-    num_epochs: 3  # Number of adaptation epochs
+    num_epochs: 1  # Number of adaptation epochs
 
   # Phase 3: Test images (with potential patches)
   test:
-    patch_path: /home/junesang/ImageNet-Patch/coco_with_patches  # Path to test images
+    patch_path: /home/junesang/ImageNet-Patch/patch_dataset/evaluation  # Path to test images
+    num_samples: 500  # -1 = 전체 사용, 양수 = 해당 개수만 사용
     batch_size: 64  # Batch size for testing
 
 # Model configuration
@@ -115,7 +116,13 @@ detection:
 # Evaluation configuration
 evaluation:
   enable_patch_metrics: true  # Enable evaluation against patch metadata
-  patch_metadata_path: /home/junesang/ImageNet-Patch/coco_with_patches/patch_metadata.json  # Path to patch metadata JSON
+  patch_metadata_path: /home/junesang/ImageNet-Patch/patch_dataset/evaluation/evaluation_metadata.json  # Path to patch metadata JSON
+
+  # Evaluation mode (noise type to evaluate)
+  # Options: "silent" (no noise), "gaussian", "shot", "impulse"
+  # When using generator.py datasets, this determines which noise variant to test
+  mode: "silent"  # Default: no noise
+
 
 # Output configuration
 output:

@@ -131,17 +131,60 @@ def _extract_polygons(entry):
     return polygons
 
 
-def load_patch_metadata(metadata_path):
+def load_patch_metadata(metadata_path, eval_mode="silent"):
+    """
+    Load patch metadata from various formats.
+    Supports:
+    - Legacy format: {"images": [...]}
+    - Generator.py format: {"test": {"clean": [...], "patched": [...]}}
+    - Evaluation format: {"test_mixed": [...], "test_mixed_gaussian": [...]}
+
+    Args:
+        metadata_path: Path to metadata JSON file
+        eval_mode: Evaluation mode - "silent", "gaussian", "shot", "impulse"
+                   Determines which noise variant to load for generator.py datasets
+    """
     metadata_path = Path(metadata_path)
     with metadata_path.open('r') as f:
         data = json.load(f)
 
+    images = []
+
     if isinstance(data, dict):
-        images = data.get('images') or data.get('data') or []
+        # Check if it's generator.py format
+        if 'test' in data and isinstance(data['test'], dict):
+            # Generator.py dataset format
+            test_data = data['test']
+
+            if eval_mode == "silent":
+                # Load clean and patched without noise
+                images.extend(test_data.get('clean', []))
+                images.extend(test_data.get('patched', []))
+            else:
+                # Load noisy versions
+                images.extend(test_data.get(f'clean_{eval_mode}', []))
+                images.extend(test_data.get(f'patched_{eval_mode}', []))
+
+            print(f"  Loaded generator.py format metadata (mode: {eval_mode})")
+
+        # Check if it's evaluation format
+        elif f'test_mixed' in data:
+            # Evaluation format (mixed clean + patched)
+            if eval_mode == "silent":
+                images = data.get('test_mixed', [])
+            else:
+                images = data.get(f'test_mixed_{eval_mode}', [])
+
+            print(f"  Loaded evaluation format metadata (mode: {eval_mode})")
+
+        # Legacy format
+        else:
+            images = data.get('images') or data.get('data') or []
+            print(f"  Loaded legacy format metadata")
+
     elif isinstance(data, list):
         images = data
-    else:
-        images = []
+        print(f"  Loaded list format metadata")
 
     metadata = {}
     for entry in images:
@@ -559,11 +602,58 @@ def main(cfg: DictConfig):
 
     phase3_start = time.time()
 
+    # Get evaluation mode to auto-select the correct subdirectory
+    evaluation_cfg = getattr(cfg, 'evaluation', None)
+    def _eval_cfg_get_early(key, default=None):
+        if evaluation_cfg is None:
+            return default
+        if isinstance(evaluation_cfg, dict):
+            return evaluation_cfg.get(key, default)
+        return getattr(evaluation_cfg, key, default)
+
+    eval_mode = _eval_cfg_get_early('mode', 'silent')
+    if eval_mode not in ['silent', 'gaussian', 'shot', 'impulse']:
+        print(f"\n⚠ Warning: Invalid evaluation mode '{eval_mode}', using 'silent'")
+        eval_mode = 'silent'
+
     patch_folder = Path(cfg.data.test.patch_path)
+
+    # Auto-detect and select correct subdirectory based on evaluation mode
+    # Check if path is a directory containing subdirectories (generator.py structure)
+    if patch_folder.exists() and patch_folder.is_dir():
+        # Check for evaluation structure (evaluation/test_mixed, evaluation/test_mixed_gaussian, etc.)
+        if eval_mode == "silent":
+            candidate_dirs = [
+                patch_folder / "test_mixed",  # Evaluation format
+                patch_folder / "test",  # Generator format (will need further selection)
+                patch_folder  # Already pointing to the right place
+            ]
+        else:
+            candidate_dirs = [
+                patch_folder / f"test_mixed_{eval_mode}",  # Evaluation format
+                patch_folder / "test",  # Generator format (will need further selection)
+                patch_folder  # Already pointing to the right place
+            ]
+
+        # Try to find the right directory
+        for candidate in candidate_dirs:
+            if candidate.exists() and candidate.is_dir():
+                # Check if it has images
+                has_images = any(
+                    f.suffix.lower() in {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.webp'}
+                    for f in candidate.iterdir()
+                    if f.is_file()
+                )
+                if has_images:
+                    if candidate != patch_folder:
+                        print(f"✓ Auto-selected subdirectory for mode '{eval_mode}': {candidate.name}")
+                        patch_folder = candidate
+                    break
 
     if not patch_folder.exists():
         print(f"\n✗ Error: Test folder not found: {patch_folder}")
         print(f"  Please update the path in configs/config.yaml")
+        print(f"  Current evaluation mode: {eval_mode}")
         extractor.remove_hooks()
         return
 
@@ -580,6 +670,15 @@ def main(cfg: DictConfig):
 
     try:
         patch_dataset = LocalImageDataset(patch_folder, transform=transform)
+
+        # Apply num_samples limit if specified
+        num_samples = getattr(cfg.data.test, 'num_samples', -1)
+        if num_samples > 0 and num_samples < len(patch_dataset):
+            print(f"✓ Found {len(patch_dataset)} test images, using first {num_samples}")
+            patch_dataset = Subset(patch_dataset, list(range(num_samples)))
+        else:
+            print(f"\n✓ Found {len(patch_dataset)} test images")
+
         patch_loader = DataLoader(
             patch_dataset,
             batch_size=cfg.data.test.batch_size,
@@ -587,8 +686,6 @@ def main(cfg: DictConfig):
             num_workers=cfg.device.num_workers,
             pin_memory=True
         )
-
-        print(f"\n✓ Found {len(patch_dataset)} test images")
 
         # Create output directory
         output_dir = Path(cfg.output.dir)
@@ -632,12 +729,35 @@ def main(cfg: DictConfig):
             if not metadata_path.is_absolute():
                 metadata_path = Path(metadata_path_value)
 
+            # Auto-detect metadata file if path doesn't exist
+            if not metadata_path.exists():
+                # Try to find metadata in parent directory of patch_folder
+                parent_dir = Path(cfg.data.test.patch_path)
+                if (parent_dir / "evaluation").exists():
+                    parent_dir = parent_dir / "evaluation"
+
+                candidate_metadata = [
+                    parent_dir / "evaluation_metadata.json",
+                    parent_dir / "dataset_metadata.json",
+                    parent_dir.parent / "evaluation_metadata.json",
+                    parent_dir.parent / "dataset_metadata.json",
+                ]
+
+                for candidate in candidate_metadata:
+                    if candidate.exists():
+                        print(f"✓ Auto-detected metadata: {candidate}")
+                        metadata_path = candidate
+                        break
+
+            print(f"✓ Evaluation mode: {eval_mode}")
+
             if not metadata_path.exists():
                 print(f"\n⚠ Warning: Patch metadata not found: {metadata_path}. Disabling patch metrics.")
+                print(f"  Tried to auto-detect metadata file but couldn't find it.")
                 patch_eval_enabled = False
             else:
                 try:
-                    patch_metadata_map = load_patch_metadata(metadata_path)
+                    patch_metadata_map = load_patch_metadata(metadata_path, eval_mode=eval_mode)
                     print(f"✓ Loaded patch metadata for {len(patch_metadata_map)} images")
                 except Exception as meta_exc:
                     print(f"\n⚠ Warning: Failed to load patch metadata: {meta_exc}. Disabling patch metrics.")
