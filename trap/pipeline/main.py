@@ -83,11 +83,45 @@ def load_backbone_model(backbone_name, pretrained=True):
     # Vision Transformer
     elif backbone_name == 'vit_b_16':
         model = models.vit_b_16(weights='IMAGENET1K_V1' if pretrained else None)
+    elif backbone_name == 'vit_b_32':
+        model = models.vit_b_32(weights='IMAGENET1K_V1' if pretrained else None)
+    elif backbone_name == 'vit_l_16':
+        model = models.vit_l_16(weights='IMAGENET1K_V1' if pretrained else None)
+    elif backbone_name == 'vit_l_32':
+        model = models.vit_l_32(weights='IMAGENET1K_V1' if pretrained else None)
+    elif backbone_name == 'vit_h_14':
+        model = models.vit_h_14(weights='IMAGENET1K_V1' if pretrained else None)
+
+    # DeiT family
+    elif backbone_name == 'deit_tiny_patch16_224':
+        model = models.deit_tiny_patch16_224(weights='DEFAULT' if pretrained else None)
+    elif backbone_name == 'deit_small_patch16_224':
+        model = models.deit_small_patch16_224(weights='DEFAULT' if pretrained else None)
+    elif backbone_name == 'deit_base_patch16_224':
+        model = models.deit_base_patch16_224(weights='DEFAULT' if pretrained else None)
+    elif backbone_name == 'deit_base_patch16_384':
+        model = models.deit_base_patch16_384(weights='DEFAULT' if pretrained else None)
+
+    # Swin Transformer family
+    elif backbone_name == 'swin_t':
+        model = models.swin_t(weights='DEFAULT' if pretrained else None)
+    elif backbone_name == 'swin_s':
+        model = models.swin_s(weights='DEFAULT' if pretrained else None)
+    elif backbone_name == 'swin_b':
+        model = models.swin_b(weights='DEFAULT' if pretrained else None)
+    elif backbone_name == 'swin_v2_t':
+        model = models.swin_v2_t(weights='DEFAULT' if pretrained else None)
+    elif backbone_name == 'swin_v2_s':
+        model = models.swin_v2_s(weights='DEFAULT' if pretrained else None)
+    elif backbone_name == 'swin_v2_b':
+        model = models.swin_v2_b(weights='DEFAULT' if pretrained else None)
 
     else:
         raise ValueError(f"Unsupported backbone: {backbone_name}. "
                         f"Supported: resnet18/34/50/101/152, convnext_tiny/small/base, "
-                        f"mobilenet_v3_small/large, efficientnet_b0/b4, vit_b_16")
+                        f"mobilenet_v3_small/large, efficientnet_b0/b4, "
+                        f"vit_b_16/b_32/l_16/l_32/h_14, deit_tiny/small/base, "
+                        f"swin_t/s/b/v2_t/v2_s/v2_b")
 
     return model
 
@@ -393,22 +427,23 @@ def main(cfg: DictConfig):
         except:
             pass
 
+    train_transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
     if images_are_preprocessed:
-        # Images are already 224x224 from patchgen.py - no resize/crop needed!
-        transform = transforms.Compose([
+        eval_transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
-        print(f"  Using direct transform (images already 224x224)")
+        print("  Train transform: Resize→Crop→Normalize")
+        print("  Eval transform: Direct ToTensor (images already 224x224)")
     else:
-        # Images are raw - apply full preprocessing like patchgen.py
-        transform = transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        print(f"  Using full preprocessing (Resize→Crop→Normalize)")
+        eval_transform = train_transform
+        print("  Train/Eval transform: Resize→Crop→Normalize")
 
     # =========================================================================
     # PHASE 1: MODEL TRAINING
@@ -476,7 +511,7 @@ def main(cfg: DictConfig):
             from torchvision.datasets import ImageFolder
 
             # Load ImageNet dataset
-            imagenet_dataset = ImageFolder(root=cfg.data.imagenet.path, transform=transform)
+            imagenet_dataset = ImageFolder(root=cfg.data.imagenet.path, transform=train_transform)
             print(f"\n✓ Found {len(imagenet_dataset)} images in {len(imagenet_dataset.classes)} classes")
 
             # Sample subset
@@ -553,7 +588,7 @@ def main(cfg: DictConfig):
 
         if clean_domain_folder.exists():
             try:
-                clean_domain_dataset = LocalImageDataset(clean_domain_folder, transform=transform)
+                clean_domain_dataset = LocalImageDataset(clean_domain_folder, transform=train_transform)
 
                 # Sample subset if specified
                 if cfg.data.domain.num_samples > 0 and cfg.data.domain.num_samples < len(clean_domain_dataset):
@@ -739,7 +774,7 @@ def main(cfg: DictConfig):
     gt_mask_cache = {}
 
     try:
-        patch_dataset = LocalImageDataset(patch_folder, transform=transform)
+        patch_dataset = LocalImageDataset(patch_folder, transform=eval_transform)
 
         # Apply num_samples limit if specified
         num_samples = getattr(cfg.data.test, 'num_samples', -1)

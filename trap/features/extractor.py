@@ -41,12 +41,14 @@ class ActivationExtractor:
         self.normalization_eps = normalization_eps
         self.depth_scaling_range = _validate_depth_scaling(depth_scaling)
         self.depth_scalars = None
+        self._summary_logged = False
 
         self.model.eval()
 
         target_blocks = (Bottleneck, BasicBlock, CNBlock, InvertedResidual, MBConv, FusedMBConv)
 
         self.layer_names = []
+        class_name = model.__class__.__name__.lower()
         for name, module in model.named_modules():
             if isinstance(module, target_blocks):
                 layer_idx = len(self.layer_names)
@@ -54,13 +56,24 @@ class ActivationExtractor:
                 self.hooks.append(hook)
                 self.layer_names.append(name)
 
-        if hasattr(model, "encoder") and "vit" in model.__class__.__name__.lower():
+        if hasattr(model, "encoder") and any(token in class_name for token in ("vit", "visiontransformer", "deit")):
             for name, module in model.encoder.named_modules():
-                if "EncoderBlock" in module.__class__.__name__:
+                module_cls = module.__class__.__name__
+                if "EncoderBlock" in module_cls or "TransformerEncoderLayer" in module_cls:
                     layer_idx = len(self.layer_names)
-                    hook = module.register_forward_hook(self._get_activation(f"encoder.{name}", layer_idx))
+                    hook = module.register_forward_hook(
+                        self._get_activation(f"encoder.{name}", layer_idx, channels_last=True)
+                    )
                     self.hooks.append(hook)
                     self.layer_names.append(f"encoder.{name}")
+        elif "swin" in class_name:
+            for name, module in model.named_modules():
+                module_cls = module.__class__.__name__
+                if "SwinTransformerBlock" in module_cls or "SwinTransformerBlockV2" in module_cls:
+                    layer_idx = len(self.layer_names)
+                    hook = module.register_forward_hook(self._get_activation(name, layer_idx, channels_last=True))
+                    self.hooks.append(hook)
+                    self.layer_names.append(name)
 
         if not self.layer_names:
             print(f"⚠ Warning: no supported blocks found in {model.__class__.__name__}")
@@ -112,8 +125,31 @@ class ActivationExtractor:
         scale = self.depth_scalars[layer_idx].to(tensor.device)
         return tensor * scale
 
-    def _get_activation(self, name, layer_idx):
+    def _get_activation(self, name, layer_idx, channels_last: bool = False):
         def hook(module, inputs, output):
+            if isinstance(output, (tuple, list)):
+                output = output[0]
+
+            if not isinstance(output, torch.Tensor):
+                return
+
+            if channels_last:
+                if output.dim() == 4:
+                    # [B, H, W, C] -> [B, C, H, W]
+                    output = output.permute(0, 3, 1, 2).contiguous()
+                elif output.dim() == 3:
+                    # [B, N, C] -> square spatial map if possible
+                    b, n, c = output.shape
+                    spatial = int(round(n ** 0.5))
+                    if spatial * spatial == n:
+                        output = output.transpose(1, 2).reshape(b, c, spatial, spatial)
+                    elif (n - 1) > 0 and int(round((n - 1) ** 0.5)) ** 2 == (n - 1):
+                        spatial = int(round((n - 1) ** 0.5))
+                        output = output[:, 1:, :].transpose(1, 2).reshape(b, c, spatial, spatial)
+                    else:
+                        # Unable to reshape into spatial map; skip this activation
+                        return
+
             resized = self._resize_activation(output)
             pooled = self._channel_pool(resized)
             if self.normalize_steps:
@@ -129,7 +165,12 @@ class ActivationExtractor:
         self.model.eval()
         with torch.no_grad():
             _ = self.model(x)
-        return [self.activations[name] for name in self.layer_names]
+
+        ordered = [self.activations[name] for name in self.layer_names if name in self.activations]
+        if not self._summary_logged:
+            print(f"  Extracted {len(ordered)} activation tensors")
+            self._summary_logged = True
+        return ordered
 
     def remove_hooks(self):
         for hook in self.hooks:

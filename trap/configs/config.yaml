@@ -4,7 +4,7 @@
 
 # Device configuration
 device:
-  cuda_id: 2  # CUDA device ID (0, 1, 2, etc.)
+  cuda_id: 1  # CUDA device ID (0, 1, 2, etc.)
   num_workers: 24  # DataLoader workers (adjust based on CPU cores)
 
 # Data configuration
@@ -12,22 +12,22 @@ data:
   # Phase 1: ImageNet data for model training (clean images only)
   imagenet:
     path: /data/ImageNet/train  # Path to ImageNet training data
-    num_samples: 1  # Number of samples to use for training (-1 for all)
+    num_samples: -1  # Number of samples to use for training (-1 for all)
     batch_size: 512  # Batch size for training
     num_epochs: 1  # Number of training epochs
 
   # Phase 2: Domain-specific clean images for optional LoRA adaptation
   domain:
     clean_path: /data/coco/train2017  # Path to clean images of target domain
-    num_samples: 1  # Number of clean samples (-1 for all available)
+    num_samples: -1  # Number of clean samples (-1 for all available)
     batch_size: 512  # Batch size for adaptation
-    num_epochs: 1  # Number of adaptation epochs
+    num_epochs: 3  # Number of adaptation epochs
 
   # Phase 3: Test images (with potential patches)
   test:
-    patch_path: /home/junesang/ImageNet-Patch/patch_dataset/evaluation  # Path to test images
-    num_samples: 500  # -1 = 전체 사용, 양수 = 해당 개수만 사용
-    batch_size: 64  # Batch size for testing
+    patch_path: /home/junesang/patch/patch_dataset/evaluation  # Path to test images
+    num_samples: -1  # -1 = 전체 사용, 양수 = 해당 개수만 사용
+    batch_size: 1024  # Batch size for testing
 
 # Model configuration
 model:
@@ -36,12 +36,15 @@ model:
   #          convnext_tiny, convnext_small, convnext_base,
   #          mobilenet_v3_small, mobilenet_v3_large,
   #          efficientnet_b0, efficientnet_b4,
-  #          vit_b_16 (Vision Transformer)
-  backbone: convnext_tiny  # Default: ResNet-50
+  #          vit_b_16, vit_b_32, vit_l_16, vit_l_32, vit_h_14,
+  #          deit_tiny_patch16_224, deit_small_patch16_224,
+  #          deit_base_patch16_224, deit_base_patch16_384,
+  #          swin_t, swin_s, swin_b, swin_v2_t, swin_v2_s, swin_v2_b
+  backbone: swin_b  # Default: ResNet-50
 
   # Feature extraction settings
   spatial_resolution: 14  # Spatial resolution for feature extraction (7, 14, 28, 56)
-  feature_dim: 96  # Feature dimension after channel pooling
+  feature_dim: 128  # Feature dimension after channel pooling
 
   # Trajectory processing options
   trajectory:
@@ -58,7 +61,7 @@ model:
   # Model hyperparameters
   hidden_dim: 128  # Hidden dimension for model
   latent_dim: 64  # Latent dimension (for autoencoder/vae)
-  num_layers: 3  # Number of layers
+  num_layers: 4  # Number of layers
   num_heads: 4  # Number of attention heads (for transformer only)
   dropout: 0.1  # Dropout rate (for transformer)
   tcn_kernel_size: 3  # Kernel size for temporal conv models (odd number recommended)
@@ -81,7 +84,7 @@ model:
 
 # Domain Adaptation configuration (Phase 2)
 domain_adaptation:
-  enabled: true  # Enable/disable domain adaptation with LoRA
+  enabled: false  # Enable/disable domain adaptation with LoRA
 
   # LoRA settings
   lora:
@@ -90,7 +93,7 @@ domain_adaptation:
     target_modules: ['Linear', 'Conv1d']  # Module types to adapt
     optimizer: adamw  # Optimizer for LoRA training
     learning_rate: 1e-4  # Lower learning rate for fine-tuning
-    weight_decay: 0.02  # Weight decay
+    weight_decay: 1e-3  # Weight decay
 
   # Weight management for Phase 2 (LoRA Adaptation)
   phase2:
@@ -119,7 +122,7 @@ detection:
 # Evaluation configuration
 evaluation:
   enable_patch_metrics: true  # Enable evaluation against patch metadata
-  patch_metadata_path: /home/junesang/ImageNet-Patch/patch_dataset/evaluation/evaluation_metadata.json  # Path to patch metadata JSON
+  patch_metadata_path: /home/junesang/patch/patch_dataset/evaluation/evaluation_metadata.json  # Path to patch metadata JSON
 
   # Evaluation mode (noise type to evaluate)
   # Options: "silent" (no noise), "gaussian", "shot", "impulse"
