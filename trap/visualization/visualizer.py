@@ -1,9 +1,4 @@
-"""
-Visualization Module for Model-based Patch Detection
-
-This module provides visualization functions for displaying detection results.
-Supports model-based reconstruction error approach with simple, clean visualization.
-"""
+"""Visualization utilities for TRAP detection results."""
 
 import numpy as np
 import torch

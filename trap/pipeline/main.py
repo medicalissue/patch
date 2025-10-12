@@ -27,13 +27,12 @@ from torch.utils.data import DataLoader, Subset
 from torchvision import models, transforms
 from tqdm import tqdm
 
-from attracter import ModelTrainer
-from dataloader import LocalImageDataset
-from detector import PatchDetector
-from extracter import ActivationExtractor
-from trajectory import stack_trajectory
-from visualize import visualize_results
-from grid_metrics import compute_ground_truth_grid, compute_grid_metrics
+from trap.data import LocalImageDataset
+from trap.detection import PatchDetector
+from trap.evaluation import compute_grid_metrics, compute_ground_truth_grid
+from trap.features import ActivationExtractor, stack_trajectory
+from trap.training import ModelTrainer
+from trap.visualization import visualize_results
 
 
 def load_backbone_model(backbone_name, pretrained=True):
@@ -291,7 +290,7 @@ def print_phase_header(phase_num: int, phase_name: str):
     print("=" * 80)
 
 
-@hydra.main(version_base=None, config_path="configs", config_name="config")
+@hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(cfg: DictConfig):
     """
     Main function for model-based patch detection
@@ -1100,10 +1099,10 @@ def main(cfg: DictConfig):
     print(f"✓ Results saved to: {output_dir}/")
     print("=" * 80)
     print("\nTo run with different settings, use command-line overrides:")
-    print(f"  python test.py model.type=vae")
-    print(f"  python test.py model.type=transformer")
-    print(f"  python test.py domain_adaptation.enabled=true")
-    print(f"  python test.py data.imagenet.num_epochs=20")
+    print(f"  python -m trap.pipeline.main model.type=vae")
+    print(f"  python -m trap.pipeline.main model.type=transformer")
+    print(f"  python -m trap.pipeline.main domain_adaptation.enabled=true")
+    print(f"  python -m trap.pipeline.main data.imagenet.num_epochs=20")
     print("=" * 80 + "\n")
 
 

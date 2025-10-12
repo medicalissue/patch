@@ -1,10 +1,5 @@
 # ===================================================================
-# Model-based Patch Detection System Configuration
-# ===================================================================
-# Architecture:
-#   Phase 1: Model Training - Train anomaly detection model on clean ImageNet images
-#   Phase 2 (Optional): Domain Adaptation - LoRA-based fine-tuning on domain clean images
-#   Phase 3: Testing - Detect patches in test images using reconstruction error
+# TRAP Configuration (Phase 1: Training, Phase 2: LoRA, Phase 3: Testing)
 # ===================================================================
 
 # Device configuration

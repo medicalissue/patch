@@ -54,8 +54,8 @@ class PatchConfig:
     # ---- Dataset (라벨 미사용)
     # one of: 'coco', 'imagefolder', 'folder', 'cifar10', 'cifar100', 'food101', 'inat'
     DATASET_NAME = "coco"  # 'coco' or 'imagefolder' for ImageNet
-    DATA_ROOT = "/data/COCO"  # or "/data/ImageNet"
-    SPLIT = "val"
+    DATA_ROOT = "/data/coco"  # or "/data/ImageNet"
+    SPLIT = "val2017"
     DOWNLOAD = False
 
     # ---- Dataset Generation Config (following Kumar & Agarwal)
@@ -67,7 +67,7 @@ class PatchConfig:
 
     # ---- Train/Test Split Config
     CREATE_TRAIN_SET = False  # True: train/test 분할, False: test only (평가만)
-    TRAIN_TEST_RATIO = 0.6  # 3:2 = 60% train, 40% test (CREATE_TRAIN_SET=True일 때만 사용)
+    TRAIN_TEST_RATIO = 0  # 3:2 = 60% train, 40% test (CREATE_TRAIN_SET=True일 때만 사용)
     SHUFFLE = True
 
     # ---- Patch transform
