@@ -238,4 +238,9 @@ poetry.toml
 # LSP config files
 pyrightconfig.json
 
+wandb/
+lora_weights/
+model_weights/
+outputs/
+
 # End of https://www.toptal.com/developers/gitignore/api/images,python

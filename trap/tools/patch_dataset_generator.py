@@ -48,7 +48,7 @@ class PatchConfig:
     RANDOM_SEED = 42
 
     # ---- Patch / Output
-    PATCH_DATA_PATH = "assets/imagenet_patch.gz"
+    PATCH_DATA_PATH = "/home/junesang/patch/trap/tools/assets/imagenet_patch.gz"
     OUTPUT_DIR = "patch_dataset"
 
     # ---- Dataset (라벨 미사용)
@@ -61,9 +61,9 @@ class PatchConfig:
     # ---- Dataset Generation Config (following Kumar & Agarwal)
     # For COCO: 2000 clean + 2000 patched (with 10 patches each = 20000)
     # For ImageNet: 800 clean + 800 patched (with 10 patches each = 8000)
-    NUM_CLEAN_IMAGES = 2000  # 2000 for COCO, 800 for ImageNet
-    NUM_PATCH_BASE_IMAGES = 2000  # 2000 for COCO, 800 for ImageNet (각각에 10개 패치 적용)
-    NUM_PATCHES_PER_IMAGE = 10  # Each base image gets 10 different patches
+    NUM_CLEAN_IMAGES = 2500  # 2000 for COCO, 800 for ImageNet
+    NUM_PATCH_BASE_IMAGES = 2500  # 2000 for COCO, 800 for ImageNet (각각에 10개 패치 적용)
+    NUM_PATCHES_PER_IMAGE = 1  # Each base image gets 10 different patches
 
     # ---- Train/Test Split Config
     CREATE_TRAIN_SET = False  # True: train/test 분할, False: test only (평가만)
@@ -80,8 +80,8 @@ class PatchConfig:
     GENERATE_NOISY_TEST_IMAGES = True
     NOISE_TYPES = ["gaussian", "shot", "impulse"]  # Following Kumar & Agarwal
     GAUSSIAN_STD = 0.1  # Standard deviation for Gaussian noise
-    SHOT_NOISE_SCALE = 60.0  # Scale for Shot (Poisson) noise
-    IMPULSE_PROB = 0.05  # Probability for salt-and-pepper noise
+    SHOT_NOISE_SCALE = 8.0  # Scale for Shot (Poisson) noise
+    IMPULSE_PROB = 0.1  # Probability for salt-and-pepper noise
 
     @classmethod
     def print_config(cls, n_images: int):

@@ -1,0 +1,10 @@
+{
+  "class_names": {
+    "0": "clean",
+    "1": "patched"
+  },
+  "description": {
+    "0": "Clean image without adversarial patch",
+    "1": "Image with adversarial patch applied"
+  }
+}

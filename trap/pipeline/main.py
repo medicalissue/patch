@@ -772,6 +772,7 @@ def main(cfg: DictConfig):
     eval_images_missed = 0
     eval_images_false_alarm = 0
     gt_mask_cache = {}
+    image_cls_tp = image_cls_tn = image_cls_fp = image_cls_fn = 0
 
     try:
         patch_dataset = LocalImageDataset(patch_folder, transform=eval_transform)
@@ -871,6 +872,7 @@ def main(cfg: DictConfig):
         # Process test images
         print(f"\nProcessing test images...")
         results = []
+        per_image_metrics = []
         image_counter = 0
 
         for batch_idx, (imgs, img_names) in enumerate(
@@ -921,6 +923,18 @@ def main(cfg: DictConfig):
 
                     if polygons is None:
                         missing_metadata.add(img_name)
+                        per_image_metrics.append({
+                            "name": img_name,
+                            "accuracy": None,
+                            "precision": None,
+                            "recall": None,
+                            "f1": None,
+                            "tp": None,
+                            "tn": None,
+                            "fp": None,
+                            "fn": None,
+                            "has_gt": False,
+                        })
                     else:
                         height, width = img.shape[1], img.shape[2]
                         with torch.no_grad():
@@ -940,10 +954,39 @@ def main(cfg: DictConfig):
                         pred_bool = pred_mask_np.astype(bool)
                         gt_bool = gt_mask_np.astype(bool)
 
-                        eval_pixel_tp += int(np.logical_and(pred_bool, gt_bool).sum())
-                        eval_pixel_fp += int(np.logical_and(pred_bool, np.logical_not(gt_bool)).sum())
-                        eval_pixel_fn += int(np.logical_and(np.logical_not(pred_bool), gt_bool).sum())
-                        eval_pixel_tn += int(np.logical_and(np.logical_not(pred_bool), np.logical_not(gt_bool)).sum())
+                        tp = int(np.logical_and(pred_bool, gt_bool).sum())
+                        fp = int(np.logical_and(pred_bool, np.logical_not(gt_bool)).sum())
+                        fn = int(np.logical_and(np.logical_not(pred_bool), gt_bool).sum())
+                        tn = int(np.logical_and(np.logical_not(pred_bool), np.logical_not(gt_bool)).sum())
+
+                        eval_pixel_tp += tp
+                        eval_pixel_fp += fp
+                        eval_pixel_fn += fn
+                        eval_pixel_tn += tn
+
+                        denom = tp + tn + fp + fn
+                        image_accuracy = (tp + tn) / denom if denom > 0 else None
+                        image_precision = tp / (tp + fp) if (tp + fp) > 0 else None
+                        image_recall = tp / (tp + fn) if (tp + fn) > 0 else None
+                        if image_precision is not None and image_recall is not None and (image_precision + image_recall) > 0:
+                            image_f1 = 2 * image_precision * image_recall / (image_precision + image_recall)
+                        else:
+                            image_f1 = None
+
+                        per_image_metrics.append({
+                            "name": img_name,
+                            "accuracy": image_accuracy,
+                            "precision": image_precision,
+                            "recall": image_recall,
+                            "f1": image_f1,
+                            "gt_patch": bool(gt_bool.any()),
+                            "pred_patch": bool(is_detected),
+                            "tp": tp,
+                            "tn": tn,
+                            "fp": fp,
+                            "fn": fn,
+                            "has_gt": True,
+                        })
 
                         intersect = bool(np.logical_and(pred_bool, gt_bool).any())
                         pred_any = bool(pred_bool.any())
@@ -952,6 +995,10 @@ def main(cfg: DictConfig):
                         eval_images += 1
                         if gt_any:
                             eval_images_with_patch += 1
+                            if is_detected:
+                                image_cls_tp += 1
+                            else:
+                                image_cls_fn += 1
                             if intersect:
                                 eval_images_detected += 1
                             else:
@@ -959,6 +1006,10 @@ def main(cfg: DictConfig):
                                 if pred_any:
                                     eval_images_false_alarm += 1
                         else:
+                            if is_detected:
+                                image_cls_fp += 1
+                            else:
+                                image_cls_tn += 1
                             if pred_any:
                                 eval_images_false_alarm += 1
 
@@ -1078,6 +1129,28 @@ def main(cfg: DictConfig):
             print(f"    Detected (overlap >0):   {eval_images_detected}")
             print(f"    Missed patches:          {eval_images_missed}")
             print(f"  False-alarm images:        {eval_images_false_alarm}")
+
+        image_cls_total = image_cls_tp + image_cls_tn + image_cls_fp + image_cls_fn
+        if image_cls_total > 0:
+            image_cls_accuracy = (image_cls_tp + image_cls_tn) / image_cls_total
+            image_cls_precision = image_cls_tp / (image_cls_tp + image_cls_fp) if (image_cls_tp + image_cls_fp) > 0 else 0.0
+            image_cls_recall = image_cls_tp / (image_cls_tp + image_cls_fn) if (image_cls_tp + image_cls_fn) > 0 else 0.0
+            image_cls_f1 = (
+                2 * image_cls_precision * image_cls_recall / (image_cls_precision + image_cls_recall)
+                if (image_cls_precision + image_cls_recall) > 0 else 0.0
+            )
+            print(f"\nImage-Level Detection Metrics:")
+            print(f"  Evaluated images:          {image_cls_total}")
+            print(f"  Confusion Matrix:")
+            print(f"    TP (patched detected):   {image_cls_tp:6d}")
+            print(f"    TN (clean correct):      {image_cls_tn:6d}")
+            print(f"    FP (clean flagged):      {image_cls_fp:6d}")
+            print(f"    FN (patched missed):     {image_cls_fn:6d}")
+            print(f"  Performance Metrics:")
+            print(f"    Accuracy:                {image_cls_accuracy * 100:.2f}%")
+            print(f"    Precision:               {image_cls_precision * 100:.2f}%")
+            print(f"    Recall:                  {image_cls_recall * 100:.2f}%")
+            print(f"    F1 Score:                {image_cls_f1 * 100:.2f}%")
 
         # Grid-level metrics
         if grid_images_evaluated > 0:

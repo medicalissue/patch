@@ -27,7 +27,11 @@ data:
   test:
     patch_path: /home/junesang/patch/patch_dataset/evaluation  # Path to test images
     num_samples: -1  # -1 = 전체 사용, 양수 = 해당 개수만 사용
+<<<<<<< HEAD
     batch_size: 1024  # Batch size for testing
+=======
+    batch_size: 256  # Batch size for testing
+>>>>>>> 9ca2aff (comm)
 
 # Model configuration
 model:
@@ -40,11 +44,19 @@ model:
   #          deit_tiny_patch16_224, deit_small_patch16_224,
   #          deit_base_patch16_224, deit_base_patch16_384,
   #          swin_t, swin_s, swin_b, swin_v2_t, swin_v2_s, swin_v2_b
+<<<<<<< HEAD
   backbone: swin_b  # Default: ResNet-50
 
   # Feature extraction settings
   spatial_resolution: 14  # Spatial resolution for feature extraction (7, 14, 28, 56)
   feature_dim: 128  # Feature dimension after channel pooling
+=======
+  backbone: resnet18  # Default: ResNet-50
+
+  # Feature extraction settings
+  spatial_resolution: 14  # Spatial resolution for feature extraction (7, 14, 28, 56)
+  feature_dim: 64  # Feature dimension after channel pooling
+>>>>>>> 9ca2aff (comm)
 
   # Trajectory processing options
   trajectory:
@@ -105,13 +117,13 @@ domain_adaptation:
 # Detection configuration
 detection:
   # Threshold method for anomaly scores: 'mean_std', 'median_mad', 'percentile'
-  threshold_method: mean_std
+  threshold_method: median_mad
 
   # Parameters for 'mean_std' method
   threshold_multiplier: 3.0  # Threshold = mean + k*std
 
   # Parameters for 'median_mad' method (robust to outliers)
-  mad_multiplier: 3.0  # Threshold = median + c*MAD
+  mad_multiplier: 7.0  # Threshold = median + c*MAD
 
   # Parameters for 'percentile' method
   percentile: 95.0  # Use this percentile as threshold
