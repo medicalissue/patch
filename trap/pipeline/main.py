@@ -375,7 +375,6 @@ def main(cfg: DictConfig):
     # Setup activation extractor
     print(f"\nSetting up activation extractor...")
     print(f"  Spatial resolution: {cfg.model.spatial_resolution}x{cfg.model.spatial_resolution}")
-    print(f"  Feature dimension: {cfg.model.feature_dim}")
 
     trajectory_cfg = getattr(cfg.model, 'trajectory', None)
     normalize_steps = True
@@ -394,13 +393,20 @@ def main(cfg: DictConfig):
 
     extractor = ActivationExtractor(
         model,
-        feature_dim=cfg.model.feature_dim,
         spatial_size=cfg.model.spatial_resolution,
         normalize_steps=normalize_steps,
         normalization_eps=normalization_eps,
         depth_scaling=depth_scaling,
     )
+    # Move extractor to the same device as the model
+    extractor.to(device)
     print("✓ Extractor initialized")
+
+    # Get auto-detected feature dimension
+    feature_dim = extractor.target_channels
+    if feature_dim is None:
+        raise RuntimeError("Failed to auto-detect feature dimensions. Check if model has supported layers.")
+    print(f"  Auto-detected feature dimension: {feature_dim}")
 
     # Image preprocessing - MUST match patchgen.py exactly!
     # If images are already 224x224 (from patchgen.py), we need different preprocessing
@@ -461,7 +467,7 @@ def main(cfg: DictConfig):
     # Create model trainer
     model_trainer = ModelTrainer(
         model_type=cfg.model.type,
-        input_dim=cfg.model.feature_dim,
+        input_dim=feature_dim,
         device=device,
         cfg=cfg,
     )
@@ -476,7 +482,7 @@ def main(cfg: DictConfig):
     model_config_str = (
         f"{cfg.model.type}_"
         f"res{cfg.model.spatial_resolution}_"
-        f"feat{cfg.model.feature_dim}_"
+        f"feat{feature_dim}_"
         f"hid{cfg.model.hidden_dim}_"
         f"lat{cfg.model.latent_dim}_"
         f"L{cfg.model.num_layers}"

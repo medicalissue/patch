@@ -11,6 +11,7 @@ __all__ = [
     "TemporalConvAutoencoder",
     "TemporalConvVAE",
     "TimeSeriesTransformer",
+    "TimeSeriesTransformerVAE",
 ]
 
 
@@ -340,3 +341,101 @@ class TimeSeriesTransformer(nn.Module):
         mse = F.mse_loss(reconstruction, x, reduction="none")
         anomaly_scores = mse.mean(dim=[1, 2])
         return anomaly_scores
+
+
+class TimeSeriesTransformerVAE(nn.Module):
+    """Transformer-based variational autoencoder for trajectory modelling."""
+
+    def __init__(
+        self,
+        input_dim,
+        hidden_dim: int = 128,
+        latent_dim: int = 64,
+        num_heads: int = 4,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.latent_dim = latent_dim
+        self.num_heads = num_heads
+        self.num_layers = num_layers
+
+        # Encoder
+        self.input_projection = nn.Linear(input_dim, hidden_dim)
+        self.pos_encoder = PositionalEncoding(hidden_dim, dropout)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # VAE latent projection
+        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
+        self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
+
+        # Decoder
+        self.latent_projection = nn.Linear(latent_dim, hidden_dim)
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+        self.output_projection = nn.Linear(hidden_dim, input_dim)
+
+    def encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Encode input sequence to latent distribution parameters."""
+        x_proj = self.input_projection(x)
+        x_pos = self.pos_encoder(x_proj)
+        memory = self.transformer_encoder(x_pos)
+        # Use mean pooling over sequence
+        pooled = memory.mean(dim=1)
+        mu = self.fc_mu(pooled)
+        logvar = self.fc_logvar(pooled)
+        return mu, logvar
+
+    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        """Reparameterization trick for VAE."""
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def decode(self, z: torch.Tensor, seq_len: int) -> torch.Tensor:
+        """Decode latent vector to sequence."""
+        # Project latent to hidden and repeat for sequence
+        hidden = self.latent_projection(z)
+        # Create memory as repeated latent representation
+        memory = hidden.unsqueeze(1).repeat(1, seq_len, 1)
+        # Apply positional encoding to memory
+        memory = self.pos_encoder(memory)
+        # Decode
+        decoded = self.transformer_decoder(memory, memory)
+        reconstruction = self.output_projection(decoded)
+        return reconstruction
+
+    def forward(self, x: torch.Tensor):
+        """Forward pass through VAE."""
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        reconstruction = self.decode(z, x.shape[1])
+        return reconstruction, mu, logvar
+
+    def compute_anomaly_score(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute anomaly score combining reconstruction and KL divergence."""
+        reconstruction, mu, logvar = self.forward(x)
+
+        # Reconstruction loss
+        recon_loss = F.mse_loss(reconstruction, x, reduction="none")
+        recon_loss = recon_loss.mean(dim=[1, 2])
+
+        # KL divergence
+        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+
+        return recon_loss + 0.001 * kl_loss

@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torchvision.models.convnext import CNBlock
@@ -20,28 +21,71 @@ def _validate_depth_scaling(depth_scaling):
     raise ValueError("depth_scaling must be None, a (start, end) tuple, or dict with start/end")
 
 
-class ActivationExtractor:
+class LearnableAttentionPool(nn.Module):
+    """Learnable attention pooling for channel reduction."""
+
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        # Query: [out_channels, in_channels]
+        self.query = nn.Parameter(torch.randn(out_channels, in_channels) / (in_channels ** 0.5))
+        self.scale = in_channels ** -0.5
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Args:
+            x: [B, C, H, W]
+        Returns:
+            [B, out_channels, H, W]
+        """
+        b, c, h, w = x.shape
+        # x: [B, C, H, W] -> [B, C, H*W]
+        x_flat = x.view(b, c, h * w)
+        # x_flat: [B, C, N] -> [B, N, C]
+        x_flat = x_flat.transpose(1, 2)
+
+        # query: [out_channels, C] @ x_flat.T: [B, C, N] -> [B, out_channels, N]
+        # attn_logits: [B, out_channels, N]
+        attn_logits = torch.einsum('oc,bnc->bon', self.query, x_flat) * self.scale
+        attn_weights = F.softmax(attn_logits, dim=-1)
+
+        # Weighted sum: [B, out_channels, N] @ [B, N, C] -> [B, out_channels, C]
+        pooled = torch.einsum('bon,bnc->boc', attn_weights, x_flat)
+
+        # Sum across input channels: [B, out_channels, C] -> [B, out_channels]
+        pooled = pooled.mean(dim=-1, keepdim=True)
+
+        # Broadcast back to spatial dimensions: [B, out_channels, 1] -> [B, out_channels, H, W]
+        pooled = pooled.unsqueeze(-1).expand(b, self.out_channels, h, w)
+
+        return pooled
+
+
+class ActivationExtractor(nn.Module):
     """Collect intermediate activations from CNN or ViT backbones."""
 
     def __init__(
         self,
         model,
-        feature_dim: int = 128,
         spatial_size: int = 14,
         normalize_steps: bool = True,
         normalization_eps: float = 1e-6,
         depth_scaling=None,
     ):
+        super().__init__()
         self.model = model
         self.activations = {}
         self.hooks = []
-        self.feature_dim = feature_dim
+        self.target_channels = None  # Will be auto-detected
         self.spatial_size = spatial_size
         self.normalize_steps = normalize_steps
         self.normalization_eps = normalization_eps
         self.depth_scaling_range = _validate_depth_scaling(depth_scaling)
         self.depth_scalars = None
         self._summary_logged = False
+        self.channel_poolers = nn.ModuleDict()
+        self.layer_channels = {}
 
         self.model.eval()
 
@@ -79,6 +123,7 @@ class ActivationExtractor:
             print(f"⚠ Warning: no supported blocks found in {model.__class__.__name__}")
 
         self._init_depth_scalars()
+        self._detect_and_init_channel_poolers()
 
     def _init_depth_scalars(self):
         if self.depth_scaling_range is None or not self.layer_names:
@@ -92,6 +137,58 @@ class ActivationExtractor:
             scalars = torch.linspace(start, end, steps=len(self.layer_names), dtype=torch.float32)
         self.depth_scalars = scalars
 
+    def _detect_and_init_channel_poolers(self):
+        """Detect channel dimensions for each layer and initialize attention poolers."""
+        # Temporary hook to collect channel dimensions
+        temp_activations = {}
+
+        def temp_hook(name):
+            def hook(module, inputs, output):
+                if isinstance(output, (tuple, list)):
+                    output = output[0]
+                if isinstance(output, torch.Tensor):
+                    if output.dim() == 4:
+                        temp_activations[name] = output.shape[1]  # C from [B, C, H, W]
+                    elif output.dim() == 3:
+                        temp_activations[name] = output.shape[2]  # C from [B, N, C]
+            return hook
+
+        # Register temporary hooks
+        temp_hooks = []
+        for name, module in self.model.named_modules():
+            if name in self.layer_names:
+                h = module.register_forward_hook(temp_hook(name))
+                temp_hooks.append(h)
+
+        # Run a dummy forward pass
+        with torch.no_grad():
+            dummy_input = torch.randn(1, 3, 224, 224)
+            # Get the device of the model
+            model_device = next(self.model.parameters()).device
+            dummy_input = dummy_input.to(model_device)
+            self.model(dummy_input)
+
+        # Remove temporary hooks
+        for h in temp_hooks:
+            h.remove()
+
+        # Store channel info
+        for name in self.layer_names:
+            if name in temp_activations:
+                self.layer_channels[name] = temp_activations[name]
+
+        # Find minimum channel count and use it as target
+        if self.layer_channels:
+            self.target_channels = min(self.layer_channels.values())
+
+            print(f"  Auto-detected channel dimensions: min={self.target_channels}, using as target")
+
+            # Initialize attention poolers for each layer that needs reduction
+            for name, in_channels in self.layer_channels.items():
+                if in_channels > self.target_channels:
+                    safe_name = name.replace(".", "_")
+                    self.channel_poolers[safe_name] = LearnableAttentionPool(in_channels, self.target_channels)
+
     def _resize_activation(self, tensor: Tensor) -> Tensor:
         _, _, h, w = tensor.shape
         if h == self.spatial_size and w == self.spatial_size:
@@ -102,15 +199,21 @@ class ActivationExtractor:
 
         return F.interpolate(tensor, size=(self.spatial_size, self.spatial_size), mode="bilinear", align_corners=False)
 
-    def _channel_pool(self, tensor: Tensor) -> Tensor:
+    def _channel_pool(self, tensor: Tensor, layer_name: str) -> Tensor:
         b, c, h, w = tensor.shape
-        if c > self.feature_dim:
-            group_size = c // self.feature_dim
-            remainder = c % self.feature_dim
-            if remainder != 0:
-                tensor = tensor[:, : self.feature_dim * group_size, :, :]
-            pooled_reshaped = tensor.view(b, self.feature_dim, group_size, h, w)
-            return pooled_reshaped.mean(dim=2)
+        if self.target_channels and c > self.target_channels:
+            safe_name = layer_name.replace(".", "_")
+            if safe_name in self.channel_poolers:
+                # Use learnable attention pooling
+                return self.channel_poolers[safe_name](tensor)
+            else:
+                # Fallback to average pooling if pooler not found
+                group_size = c // self.target_channels
+                remainder = c % self.target_channels
+                if remainder != 0:
+                    tensor = tensor[:, : self.target_channels * group_size, :, :]
+                pooled_reshaped = tensor.view(b, self.target_channels, group_size, h, w)
+                return pooled_reshaped.mean(dim=2)
 
         return tensor
 
@@ -151,7 +254,7 @@ class ActivationExtractor:
                         return
 
             resized = self._resize_activation(output)
-            pooled = self._channel_pool(resized)
+            pooled = self._channel_pool(resized, name)
             if self.normalize_steps:
                 pooled = self._normalize_step(pooled)
             pooled = self._apply_depth_scaling(pooled, layer_idx)

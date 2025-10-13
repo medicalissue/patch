@@ -4,7 +4,7 @@
 
 # Device configuration
 device:
-  cuda_id: 1  # CUDA device ID (0, 1, 2, etc.)
+  cuda_id: 0  # CUDA device ID (0, 1, 2, etc.)
   num_workers: 24  # DataLoader workers (adjust based on CPU cores)
 
 # Data configuration
@@ -13,25 +13,21 @@ data:
   imagenet:
     path: /data/ImageNet/train  # Path to ImageNet training data
     num_samples: -1  # Number of samples to use for training (-1 for all)
-    batch_size: 512  # Batch size for training
+    batch_size: 128  # Batch size for training
     num_epochs: 1  # Number of training epochs
 
   # Phase 2: Domain-specific clean images for optional LoRA adaptation
   domain:
     clean_path: /data/coco/train2017  # Path to clean images of target domain
     num_samples: -1  # Number of clean samples (-1 for all available)
-    batch_size: 512  # Batch size for adaptation
+    batch_size: 256  # Batch size for adaptation
     num_epochs: 3  # Number of adaptation epochs
 
   # Phase 3: Test images (with potential patches)
   test:
     patch_path: /home/junesang/patch/patch_dataset/evaluation  # Path to test images
     num_samples: -1  # -1 = 전체 사용, 양수 = 해당 개수만 사용
-<<<<<<< HEAD
-    batch_size: 1024  # Batch size for testing
-=======
     batch_size: 256  # Batch size for testing
->>>>>>> 9ca2aff (comm)
 
 # Model configuration
 model:
@@ -44,19 +40,11 @@ model:
   #          deit_tiny_patch16_224, deit_small_patch16_224,
   #          deit_base_patch16_224, deit_base_patch16_384,
   #          swin_t, swin_s, swin_b, swin_v2_t, swin_v2_s, swin_v2_b
-<<<<<<< HEAD
-  backbone: swin_b  # Default: ResNet-50
+  backbone: resnet50  # Default: ResNet-50
 
   # Feature extraction settings
   spatial_resolution: 14  # Spatial resolution for feature extraction (7, 14, 28, 56)
-  feature_dim: 128  # Feature dimension after channel pooling
-=======
-  backbone: resnet18  # Default: ResNet-50
-
-  # Feature extraction settings
-  spatial_resolution: 14  # Spatial resolution for feature extraction (7, 14, 28, 56)
-  feature_dim: 64  # Feature dimension after channel pooling
->>>>>>> 9ca2aff (comm)
+  # feature_dim: REMOVED - now auto-detected as minimum channel count across all layers
 
   # Trajectory processing options
   trajectory:
@@ -67,8 +55,8 @@ model:
       start: 0.8  # Scale factor for earliest layer
       end: 1.2  # Scale factor for deepest layer
 
-  # Model architecture selection: 'autoencoder', 'vae', 'tcn_autoencoder', 'tcn_vae', 'transformer'
-  type: tcn_vae  # Choose time-series anomaly detection model
+  # Model architecture selection: 'autoencoder', 'vae', 'tcn_autoencoder', 'tcn_vae', 'transformer', 'transformer_vae'
+  type: transformer_vae  # Choose time-series anomaly detection model
 
   # Model hyperparameters
   hidden_dim: 128  # Hidden dimension for model

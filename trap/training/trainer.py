@@ -40,6 +40,7 @@ class ModelTrainer:
         latent_dim = self._cfg_get("latent_dim", 64)
         num_layers = self._cfg_get("num_layers", 2)
         num_heads = self._cfg_get("num_heads", 4)
+        dropout = self._cfg_get("dropout", 0.1)
         tcn_kernel_size = self._cfg_get("tcn_kernel_size", 3)
         tcn_dilation_base = self._cfg_get("tcn_dilation_base", 2)
         tcn_dropout = self._cfg_get("tcn_dropout", 0.1)
@@ -51,6 +52,7 @@ class ModelTrainer:
             latent_dim=latent_dim,
             num_layers=num_layers,
             num_heads=num_heads,
+            dropout=dropout,
             tcn_kernel_size=tcn_kernel_size,
             tcn_dilation_base=tcn_dilation_base,
             tcn_dropout=tcn_dropout,
@@ -70,7 +72,7 @@ class ModelTrainer:
         print(f"    Hidden dim: {hidden_dim}")
         if self.model_type in ["autoencoder", "vae", "tcn_autoencoder", "tcn_vae"]:
             print(f"    Latent dim: {latent_dim}")
-        if self.model_type in ["vae", "tcn_vae"]:
+        if self.model_type in ["vae", "tcn_vae", "transformer_vae"]:
             print(f"    VAE beta max: {self.vae_beta_max}")
             print(f"    VAE beta warmup steps: {self.vae_beta_warmup_steps}")
         if self.model_type in ["tcn_autoencoder", "tcn_vae"]:
@@ -92,7 +94,7 @@ class ModelTrainer:
         return getattr(cfg, key, default)
 
     def _compute_beta(self, step: int):
-        if self.model_type not in ["vae", "tcn_vae"]:
+        if self.model_type not in ["vae", "tcn_vae", "transformer_vae"]:
             return None
         if step is None:
             return self.vae_beta_max
@@ -107,7 +109,7 @@ class ModelTrainer:
 
         metrics: Dict[str, Any] = {}
 
-        if self.model_type in ["vae", "tcn_vae"]:
+        if self.model_type in ["vae", "tcn_vae", "transformer_vae"]:
             beta = self._compute_beta(global_step)
             reconstruction, mu, logvar = self.model(trajectories)
 
@@ -226,7 +228,7 @@ class ModelTrainer:
                     "epoch_loss": avg_loss,
                     "epoch_recon_loss": avg_recon,
                 }
-                if self.model_type in ["vae", "tcn_vae"] and num_batches > 0:
+                if self.model_type in ["vae", "tcn_vae", "transformer_vae"] and num_batches > 0:
                     log_data["epoch_kl_loss"] = epoch_kl / num_batches
                 wandb.log(log_data)
 
@@ -271,7 +273,7 @@ class ModelTrainer:
                 self.optimizer.zero_grad()
                 global_step += 1
 
-                if self.model_type in ["vae", "tcn_vae"]:
+                if self.model_type in ["vae", "tcn_vae", "transformer_vae"]:
                     reconstruction, mu, logvar = self.model(batch)
                     recon_loss = nn.functional.mse_loss(reconstruction, batch)
                     kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
@@ -292,7 +294,7 @@ class ModelTrainer:
 
             avg_loss = epoch_loss / num_batches
             print(f"    Epoch {epoch + 1}/{num_epochs}: Loss = {avg_loss:.6f}")
-            if self.model_type in ["vae", "tcn_vae"] and num_batches > 0:
+            if self.model_type in ["vae", "tcn_vae", "transformer_vae"] and num_batches > 0:
                 print(f"      Recon: {epoch_recon / num_batches:.6f}, KL: {epoch_kl / num_batches:.6f}")
 
         self.fitted = True
@@ -403,7 +405,7 @@ class ModelTrainer:
                 lora_optimizer.zero_grad()
                 global_step += 1
 
-                if self.model_type in ["vae", "tcn_vae"]:
+                if self.model_type in ["vae", "tcn_vae", "transformer_vae"]:
                     reconstruction, mu, logvar = self.model(batch)
                     recon_loss = nn.functional.mse_loss(reconstruction, batch)
                     kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
@@ -424,7 +426,7 @@ class ModelTrainer:
 
             avg_loss = epoch_loss / num_batches
             print(f"    Epoch {epoch + 1}/{num_epochs}: Loss = {avg_loss:.6f}")
-            if self.model_type in ["vae", "tcn_vae"] and num_batches > 0:
+            if self.model_type in ["vae", "tcn_vae", "transformer_vae"] and num_batches > 0:
                 print(f"      Recon: {epoch_recon / num_batches:.6f}, KL: {epoch_kl / num_batches:.6f}")
 
         print(f"  ✓ LoRA domain adaptation completed")
@@ -534,7 +536,7 @@ class ModelTrainer:
                 step_id = global_step + 1
 
                 batch_recon_value = None
-                if self.model_type in ["vae", "tcn_vae"]:
+                if self.model_type in ["vae", "tcn_vae", "transformer_vae"]:
                     reconstruction, mu, logvar = self.model(trajectories)
                     recon_loss = nn.functional.mse_loss(reconstruction, trajectories)
                     kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
@@ -568,20 +570,20 @@ class ModelTrainer:
                         "epoch": epoch + 1,
                         "global_step": global_step,
                     }
-                    if self.model_type in ["vae", "tcn_vae"]:
+                    if self.model_type in ["vae", "tcn_vae", "transformer_vae"]:
                         log_data["lora_batch_kl_loss"] = kl_loss.detach().item()
                         log_data["vae_beta"] = beta
                     wandb.log(log_data)
 
                 del imgs_gpu, activations, embeddings_batch, trajectories, reconstruction, loss
-                if self.model_type in ["vae", "tcn_vae"]:
+                if self.model_type in ["vae", "tcn_vae", "transformer_vae"]:
                     del mu, logvar, recon_loss, kl_loss
                 torch.cuda.empty_cache()
 
             avg_loss = epoch_loss / num_batches
             print(f"    Epoch {epoch + 1}/{num_epochs}: Loss = {avg_loss:.6f}")
             avg_recon = epoch_recon / num_batches if num_batches > 0 else 0.0
-            if self.model_type in ["vae", "tcn_vae"] and num_batches > 0:
+            if self.model_type in ["vae", "tcn_vae", "transformer_vae"] and num_batches > 0:
                 print(f"      Recon: {avg_recon:.6f}, KL: {epoch_kl / num_batches:.6f}")
 
             if use_wandb:
@@ -592,7 +594,7 @@ class ModelTrainer:
                     "lora_loss": avg_loss,
                     "lora_epoch_recon_loss": avg_recon,
                 }
-                if self.model_type in ["vae", "tcn_vae"] and num_batches > 0:
+                if self.model_type in ["vae", "tcn_vae", "transformer_vae"] and num_batches > 0:
                     log_data["lora_epoch_kl_loss"] = epoch_kl / num_batches
                 wandb.log(log_data)
 
