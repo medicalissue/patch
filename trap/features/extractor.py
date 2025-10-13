@@ -22,42 +22,41 @@ def _validate_depth_scaling(depth_scaling):
 
 
 class LearnableAttentionPool(nn.Module):
-    """Learnable attention pooling for channel reduction."""
+    """Learnable attention pooling for channel reduction via learned weighted sum."""
 
     def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        # Query: [out_channels, in_channels]
-        self.query = nn.Parameter(torch.randn(out_channels, in_channels) / (in_channels ** 0.5))
-        self.scale = in_channels ** -0.5
+        # Learnable attention weights: [out_channels, in_channels]
+        # Use Xavier uniform initialization for stability
+        self.attention_weights = nn.Parameter(torch.empty(out_channels, in_channels))
+        nn.init.xavier_uniform_(self.attention_weights, gain=1.0)
 
     def forward(self, x: Tensor) -> Tensor:
         """
+        Apply learnable weighted sum across input channels.
         Args:
-            x: [B, C, H, W]
+            x: [B, C, H, W] where C = in_channels
         Returns:
             [B, out_channels, H, W]
         """
         b, c, h, w = x.shape
+
+        # Normalize attention weights via softmax over input channels
+        # Shape: [out_channels, in_channels]
+        attn = F.softmax(self.attention_weights, dim=1)
+
+        # Reshape for matrix multiplication
         # x: [B, C, H, W] -> [B, C, H*W]
-        x_flat = x.view(b, c, h * w)
-        # x_flat: [B, C, N] -> [B, N, C]
-        x_flat = x_flat.transpose(1, 2)
+        x_reshaped = x.view(b, c, h * w)
 
-        # query: [out_channels, C] @ x_flat.T: [B, C, N] -> [B, out_channels, N]
-        # attn_logits: [B, out_channels, N]
-        attn_logits = torch.einsum('oc,bnc->bon', self.query, x_flat) * self.scale
-        attn_weights = F.softmax(attn_logits, dim=-1)
+        # Apply attention: [out_channels, in_channels] @ [B, in_channels, H*W]
+        # -> [B, out_channels, H*W]
+        pooled = torch.einsum('oi,bip->bop', attn, x_reshaped)
 
-        # Weighted sum: [B, out_channels, N] @ [B, N, C] -> [B, out_channels, C]
-        pooled = torch.einsum('bon,bnc->boc', attn_weights, x_flat)
-
-        # Sum across input channels: [B, out_channels, C] -> [B, out_channels]
-        pooled = pooled.mean(dim=-1, keepdim=True)
-
-        # Broadcast back to spatial dimensions: [B, out_channels, 1] -> [B, out_channels, H, W]
-        pooled = pooled.unsqueeze(-1).expand(b, self.out_channels, h, w)
+        # Reshape back to spatial: [B, out_channels, H*W] -> [B, out_channels, H, W]
+        pooled = pooled.view(b, self.out_channels, h, w)
 
         return pooled
 
@@ -254,9 +253,10 @@ class ActivationExtractor(nn.Module):
                         return
 
             resized = self._resize_activation(output)
-            pooled = self._channel_pool(resized, name)
+            # Normalize before channel pooling for stability
             if self.normalize_steps:
-                pooled = self._normalize_step(pooled)
+                resized = self._normalize_step(resized)
+            pooled = self._channel_pool(resized, name)
             pooled = self._apply_depth_scaling(pooled, layer_idx)
             self.activations[name] = pooled
 

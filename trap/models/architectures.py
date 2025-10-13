@@ -399,6 +399,8 @@ class TimeSeriesTransformerVAE(nn.Module):
         pooled = memory.mean(dim=1)
         mu = self.fc_mu(pooled)
         logvar = self.fc_logvar(pooled)
+        # Clamp logvar for numerical stability
+        logvar = torch.clamp(logvar, min=-10.0, max=10.0)
         return mu, logvar
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
@@ -413,10 +415,14 @@ class TimeSeriesTransformerVAE(nn.Module):
         hidden = self.latent_projection(z)
         # Create memory as repeated latent representation
         memory = hidden.unsqueeze(1).repeat(1, seq_len, 1)
-        # Apply positional encoding to memory
-        memory = self.pos_encoder(memory)
-        # Decode
-        decoded = self.transformer_decoder(memory, memory)
+
+        # Create query sequence with positional encoding
+        # Use learnable query tokens instead of repeating latent
+        query = hidden.unsqueeze(1).repeat(1, seq_len, 1)
+        query = self.pos_encoder(query)
+
+        # Cross-attention: query attends to memory
+        decoded = self.transformer_decoder(query, memory)
         reconstruction = self.output_projection(decoded)
         return reconstruction
 
