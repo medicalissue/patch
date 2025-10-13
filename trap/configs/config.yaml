@@ -27,7 +27,7 @@ data:
   test:
     patch_path: /home/junesang/patch/patch_dataset/evaluation  # Path to test images
     num_samples: -1  # -1 = 전체 사용, 양수 = 해당 개수만 사용
-    batch_size: 256  # Batch size for testing
+    batch_size: 1024  # Batch size for testing
 
 # Model configuration
 model:
@@ -62,18 +62,21 @@ model:
   hidden_dim: 128  # Hidden dimension for model
   latent_dim: 64  # Latent dimension (for autoencoder/vae)
   num_layers: 4  # Number of layers
-  num_heads: 4  # Number of attention heads (for transformer only)
+  num_heads: 8  # Number of attention heads (for transformer only)
   dropout: 0.1  # Dropout rate (for transformer)
   tcn_kernel_size: 3  # Kernel size for temporal conv models (odd number recommended)
   tcn_dilation_base: 2  # Dilation growth factor for temporal conv models
   tcn_dropout: 0.1  # Dropout inside temporal conv blocks
 
+  # Anomaly detection settings
+  anomaly_score_temperature: 0.01  # Temperature for per-layer error aggregation (lower=max-like, higher=mean-like)
+
   # Training settings
   optimizer: adamw  # Optimizer type ('adam', 'adamw', etc.)
-  learning_rate: 0.003  # Learning rate for Phase 1 training
+  learning_rate: 0.001  # Learning rate for Phase 1 training
   weight_decay: 0.0001  # Weight decay (L2 regularization)
   vae_beta_max: 0.001  # Target beta weight for VAE KL term
-  vae_beta_warmup_steps: 100000  # Warmup steps for beta annealing
+  vae_beta_warmup_steps: 5000  # Warmup steps for beta annealing
 
   # Weight management for Phase 1 (Base Model)
   phase1:
@@ -105,7 +108,7 @@ domain_adaptation:
 # Detection configuration
 detection:
   # Threshold method for anomaly scores: 'mean_std', 'median_mad', 'percentile'
-  threshold_method: median_mad
+  threshold_method: mean_std
 
   # Parameters for 'mean_std' method
   threshold_multiplier: 3.0  # Threshold = mean + k*std

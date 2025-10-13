@@ -354,6 +354,7 @@ class TimeSeriesTransformerVAE(nn.Module):
         num_heads: int = 4,
         num_layers: int = 2,
         dropout: float = 0.1,
+        anomaly_score_temperature: float = 0.5,
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -361,6 +362,7 @@ class TimeSeriesTransformerVAE(nn.Module):
         self.latent_dim = latent_dim
         self.num_heads = num_heads
         self.num_layers = num_layers
+        self.anomaly_score_temperature = anomaly_score_temperature
 
         # Encoder
         self.input_projection = nn.Linear(input_dim, hidden_dim)
@@ -411,17 +413,20 @@ class TimeSeriesTransformerVAE(nn.Module):
 
     def decode(self, z: torch.Tensor, seq_len: int) -> torch.Tensor:
         """Decode latent vector to sequence."""
-        # Project latent to hidden and repeat for sequence
+        # Project latent to hidden
         hidden = self.latent_projection(z)
-        # Create memory as repeated latent representation
-        memory = hidden.unsqueeze(1).repeat(1, seq_len, 1)
 
-        # Create query sequence with positional encoding
-        # Use learnable query tokens instead of repeating latent
-        query = hidden.unsqueeze(1).repeat(1, seq_len, 1)
+        # Memory: broadcast latent to sequence (no positional encoding)
+        # This serves as the "content" to decode
+        memory = hidden.unsqueeze(1).expand(-1, seq_len, -1)
+
+        # Query: start with zeros + positional encoding
+        # This provides "position information" to the decoder
+        batch_size = z.shape[0]
+        query = torch.zeros(batch_size, seq_len, self.hidden_dim, device=z.device, dtype=z.dtype)
         query = self.pos_encoder(query)
 
-        # Cross-attention: query attends to memory
+        # Cross-attention: positional queries attend to content memory
         decoded = self.transformer_decoder(query, memory)
         reconstruction = self.output_projection(decoded)
         return reconstruction
@@ -437,9 +442,14 @@ class TimeSeriesTransformerVAE(nn.Module):
         """Compute anomaly score combining reconstruction and KL divergence."""
         reconstruction, mu, logvar = self.forward(x)
 
-        # Reconstruction loss
-        recon_loss = F.mse_loss(reconstruction, x, reduction="none")
-        recon_loss = recon_loss.mean(dim=[1, 2])
+        # Per-layer reconstruction error: [B, L, D] -> [B, L]
+        per_layer_error = F.mse_loss(reconstruction, x, reduction="none").mean(dim=2)
+
+        # Softmax weighted average over layers
+        # High-error layers get more weight, but other layers still contribute
+        # Lower temperature = closer to max, Higher temperature = closer to mean
+        layer_weights = F.softmax(per_layer_error / self.anomaly_score_temperature, dim=1)
+        recon_loss = (per_layer_error * layer_weights).sum(dim=1)
 
         # KL divergence
         kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)

@@ -22,6 +22,7 @@ def create_model(
     tcn_kernel_size: int = 3,
     tcn_dilation_base: int = 2,
     tcn_dropout: float = 0.1,
+    anomaly_score_temperature: float = 0.5,
 ):
     """
     Factory function to create time-series anomaly detection models.
@@ -67,7 +68,9 @@ def create_model(
     if model_type == "transformer":
         return TimeSeriesTransformer(input_dim, hidden_dim, num_heads, num_layers, dropout)
     if model_type == "transformer_vae":
-        return TimeSeriesTransformerVAE(input_dim, hidden_dim, latent_dim, num_heads, num_layers, dropout)
+        return TimeSeriesTransformerVAE(
+            input_dim, hidden_dim, latent_dim, num_heads, num_layers, dropout, anomaly_score_temperature
+        )
 
     raise ValueError(
         f"Unsupported model_type: {model_type}. Choose from "

@@ -44,6 +44,7 @@ class ModelTrainer:
         tcn_kernel_size = self._cfg_get("tcn_kernel_size", 3)
         tcn_dilation_base = self._cfg_get("tcn_dilation_base", 2)
         tcn_dropout = self._cfg_get("tcn_dropout", 0.1)
+        anomaly_score_temperature = self._cfg_get("anomaly_score_temperature", 0.5)
 
         self.model = create_model(
             model_type=self.model_type,
@@ -56,6 +57,7 @@ class ModelTrainer:
             tcn_kernel_size=tcn_kernel_size,
             tcn_dilation_base=tcn_dilation_base,
             tcn_dropout=tcn_dropout,
+            anomaly_score_temperature=anomaly_score_temperature,
         )
         self.model.to(device)
 
